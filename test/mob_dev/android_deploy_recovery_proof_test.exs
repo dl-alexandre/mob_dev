@@ -209,6 +209,112 @@ defmodule MobDev.AndroidDeployRecoveryProofTest do
     end)
   end
 
+  describe "production apksigner resolution" do
+    test "prefers PATH over configured SDK" do
+      project = tmp_project!()
+      sdk_signer = sdk_apksigner!(project, "35.0.0")
+      path_signer = Path.join(project, "path-apksigner")
+
+      assert path_signer ==
+               AndroidDeployRecoveryProof.__test_only__(
+                 :resolve_apksigner,
+                 project,
+                 fn "apksigner" -> path_signer end
+               )
+
+      refute path_signer == sdk_signer
+    end
+
+    test "falls back to the highest executable semantic SDK build-tools version" do
+      project = tmp_project!()
+      _older = sdk_apksigner!(project, "34.0.0")
+      expected = sdk_apksigner!(project, "35.0.1")
+      _malformed = sdk_apksigner!(project, "latest")
+      _non_executable = sdk_apksigner!(project, "36.0.0", 0o644)
+
+      assert expected ==
+               AndroidDeployRecoveryProof.__test_only__(
+                 :resolve_apksigner,
+                 project,
+                 fn _name -> nil end
+               )
+    end
+
+    test "fails closed for missing, malformed, and non-executable SDK candidates" do
+      project = tmp_project!()
+      _malformed = sdk_apksigner!(project, "preview", 0o755)
+      _non_executable = sdk_apksigner!(project, "35.0.0", 0o644)
+
+      assert nil ==
+               AndroidDeployRecoveryProof.__test_only__(
+                 :resolve_apksigner,
+                 project,
+                 fn _name -> nil end
+               )
+    end
+
+    test "verification refuses nonzero and never reflects verifier output" do
+      project = tmp_project!()
+      signer = sdk_apksigner!(project, "35.0.0")
+      secret = "verifier-secret-#{System.unique_integer([:positive])}"
+
+      result =
+        capture_log(fn ->
+          output =
+            capture_io(fn ->
+              verified? =
+                AndroidDeployRecoveryProof.__test_only__(:verify_apk_signature, "app.apk",
+                  project_dir: project,
+                  path_lookup: fn _name -> nil end,
+                  runner: fn ^signer,
+                             ["verify", "--print-certs", "app.apk"],
+                             stderr_to_stdout: true ->
+                    {secret, 1}
+                  end
+                )
+
+              send(self(), {:verified, verified?})
+            end)
+
+          send(self(), {:output, output})
+        end)
+
+      assert_receive {:verified, false}
+      assert_receive {:output, output}
+      refute output =~ secret
+      refute result =~ secret
+    end
+
+    test "production command runner captures and discards verifier stderr" do
+      project = tmp_project!()
+      signer = sdk_apksigner!(project, "35.0.0")
+      secret = "stderr-secret-#{System.unique_integer([:positive])}"
+      File.write!(signer, "#!/bin/sh\necho '#{secret}' >&2\nexit 1\n")
+
+      logs =
+        capture_log(fn ->
+          output =
+            capture_io(fn ->
+              verified? =
+                AndroidDeployRecoveryProof.__test_only__(:verify_apk_signature, "app.apk",
+                  project_dir: project,
+                  path_lookup: fn _name -> nil end,
+                  runner: &System.cmd/3
+                )
+
+              send(self(), {:stderr_verified, verified?})
+            end)
+
+          send(self(), {:stderr_output, output})
+        end)
+
+      assert_receive {:stderr_verified, false}
+      assert_receive {:stderr_output, output}
+      refute output =~ secret
+      refute logs =~ secret
+    end
+  end
+
   test "operation-wide host lock is exclusive and remains held for the callback" do
     assert :ok =
              AndroidDeployRecoveryProof.with_host_lock(@bundle, fn ->
@@ -368,6 +474,29 @@ defmodule MobDev.AndroidDeployRecoveryProofTest do
     File.write!(path, "apk")
     on_exit(fn -> File.rm(path) end)
     path
+  end
+
+  defp tmp_project! do
+    project =
+      Path.join(
+        System.tmp_dir!(),
+        "mob recovery proof #{System.unique_integer([:positive])}"
+      )
+
+    sdk = Path.join(project, "configured sdk")
+    File.mkdir_p!(Path.join(project, "android"))
+    File.write!(Path.join([project, "android", "local.properties"]), "sdk.dir=#{sdk}\n")
+    on_exit(fn -> File.rm_rf(project) end)
+    project
+  end
+
+  defp sdk_apksigner!(project, version, mode \\ 0o755) do
+    {:ok, sdk} = MobDev.NativeBuild.read_sdk_dir(project)
+    signer = Path.join([sdk, "build-tools", version, "apksigner"])
+    File.mkdir_p!(Path.dirname(signer))
+    File.write!(signer, "#!/bin/sh\nexit 0\n")
+    File.chmod!(signer, mode)
+    signer
   end
 
   defp leave_stale_local_lock! do
