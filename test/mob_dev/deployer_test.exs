@@ -431,6 +431,106 @@ defmodule MobDev.DeployerTest do
       assert :ok = Deployer.cleanup_android_payload(plan)
     end
 
+    test "disables copyfile metadata for BEAM staging, priv staging, and archive inspection", %{
+      tmp_dir: dir
+    } do
+      {context, opts} = android_payload_fixture!(dir)
+      parent = self()
+
+      local_runner = fn executable, args, command_opts ->
+        if executable in ["cp", "tar"] do
+          send(parent, {:copyfile_command, executable, args, command_opts})
+        end
+
+        System.cmd(executable, args, command_opts)
+      end
+
+      assert {:ok, plan} =
+               Deployer.prepare_android_payload(
+                 context,
+                 Keyword.put(opts, :local_runner, local_runner)
+               )
+
+      commands =
+        Stream.repeatedly(fn ->
+          receive do
+            {:copyfile_command, executable, args, command_opts} ->
+              {executable, args, command_opts}
+          after
+            0 -> :done
+          end
+        end)
+        |> Enum.take_while(&(&1 != :done))
+
+      assert Enum.any?(commands, &match?({"cp", ["-r" | _], _}, &1))
+      assert Enum.any?(commands, &match?({"tar", ["cf" | _], _}, &1))
+      assert Enum.any?(commands, &match?({"tar", ["tf" | _], _}, &1))
+
+      assert Enum.all?(commands, fn {_executable, _args, command_opts} ->
+               Keyword.get(command_opts, :env) == [{"COPYFILE_DISABLE", "1"}]
+             end)
+
+      assert :ok = Deployer.cleanup_android_payload(plan)
+    end
+
+    test "rejects AppleDouble archive members without reflecting their names", %{tmp_dir: dir} do
+      {context, opts} = android_payload_fixture!(dir)
+      sensitive_member = "./._private-build-detail.beam\n"
+
+      local_runner = fn
+        "tar", ["tf", _archive], _command_opts -> {sensitive_member, 0}
+        executable, args, command_opts -> System.cmd(executable, args, command_opts)
+      end
+
+      assert {:error, reason} =
+               Deployer.prepare_android_payload(
+                 context,
+                 Keyword.put(opts, :local_runner, local_runner)
+               )
+
+      assert reason == "BEAM archive contains forbidden metadata sidecars"
+      refute reason =~ "private-build-detail"
+    end
+
+    test "bounds archive inspection output without reflection", %{tmp_dir: dir} do
+      {context, opts} = android_payload_fixture!(dir)
+      oversized_listing = String.duplicate("private-archive-detail\n", 100_000)
+
+      local_runner = fn
+        "tar", ["tf", _archive], _command_opts -> {oversized_listing, 0}
+        executable, args, command_opts -> System.cmd(executable, args, command_opts)
+      end
+
+      assert {:error, reason} =
+               Deployer.prepare_android_payload(
+                 context,
+                 Keyword.put(opts, :local_runner, local_runner)
+               )
+
+      assert reason == "Could not inspect immutable BEAM archive"
+      refute reason =~ "private-archive-detail"
+    end
+
+    test "macOS extended metadata does not create AppleDouble archive members", %{tmp_dir: dir} do
+      if :os.type() == {:unix, :darwin} and System.find_executable("xattr") do
+        {context, opts} = android_payload_fixture!(dir)
+        beam_dir = opts |> Keyword.fetch!(:beam_dirs) |> List.first()
+        [source | _] = Path.wildcard(Path.join(beam_dir, "*.beam"))
+        assert {"", 0} = System.cmd("xattr", ["-w", "com.mobdev.archive_test", "1", source])
+
+        assert {:ok, plan} = Deployer.prepare_android_payload(context, opts)
+        assert {listing, 0} = System.cmd("tar", ["tf", plan.beam.archive.path])
+
+        refute listing
+               |> String.split("\n", trim: true)
+               |> Enum.any?(fn member -> String.starts_with?(Path.basename(member), "._") end)
+
+        assert :ok = Deployer.cleanup_android_payload(plan)
+      else
+        assert :os.type() != {:unix, :darwin} or is_nil(System.find_executable("xattr"))
+      end
+    end
+
     test "rejects unchecked restart before reserving any artifact root", %{tmp_dir: dir} do
       {context, opts} = android_payload_fixture!(dir)
 
@@ -961,6 +1061,41 @@ defmodule MobDev.DeployerTest do
 
   describe "push_beams_android_runas/3" do
     @describetag :tmp_dir
+
+    test "rejects AppleDouble members in the legacy BEAM archive before adb mutation", %{
+      tmp_dir: dir
+    } do
+      beam_dir = Path.join(dir, "beams")
+      File.mkdir_p!(beam_dir)
+      File.write!(Path.join(beam_dir, "Elixir.Sample.beam"), "beam")
+      parent = self()
+
+      local_runner = fn
+        "tar", ["tf", _archive], _command_opts ->
+          {"./._private-legacy-detail.beam\n", 0}
+
+        executable, args, command_opts ->
+          System.cmd(executable, args, command_opts)
+      end
+
+      assert {:error, reason} =
+               Deployer.push_beams_android_runas("serial-a", [beam_dir],
+                 package: "com.example.casein",
+                 operation_authority: android_operation_authority!(),
+                 beams_dir: "/data/data/com.example.casein/files/otp/casein",
+                 runner: fn args ->
+                   send(parent, {:adb_command, args})
+                   {:ok, ""}
+                 end,
+                 local_runner: local_runner,
+                 tmp_root: dir,
+                 attempt_id: "testattempt00001"
+               )
+
+      assert reason == "BEAM archive contains forbidden metadata sidecars"
+      refute reason =~ "private-legacy-detail"
+      refute_received {:adb_command, _args}
+    end
 
     test "checks Android 9 no-same-owner extraction and a readable app BEAM", %{tmp_dir: dir} do
       beam_dir = Path.join(dir, "beams")

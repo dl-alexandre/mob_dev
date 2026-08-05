@@ -31,6 +31,7 @@ defmodule MobDev.Deployer do
   @android_activity ".MainActivity"
   @max_android_launch_output_bytes 4_096
   @max_android_query_output_bytes 8_192
+  @max_android_archive_listing_bytes 2 * 1024 * 1024
   # `elixir.app` is structured application metadata, not a general adb query.
   # Current reviewed releases exceed 8 KiB; keep a separate bounded read so
   # they do not weaken the smaller limit used by package/path probes.
@@ -390,13 +391,20 @@ defmodule MobDev.Deployer do
            {:ok, flag_checks} <- stage_android_beam_flags(stage, beam_flags, file_writer),
            {:ok, priv_checks} <- stage_android_priv(stage, priv_dir, local_runner),
            :ok <-
-             checked_local_command(local_runner, "create immutable BEAM archive", "tar", [
-               "cf",
-               archive_path,
-               "-C",
-               stage,
-               "."
-             ]),
+             checked_local_command(
+               local_runner,
+               "create immutable BEAM archive",
+               "tar",
+               [
+                 "cf",
+                 archive_path,
+                 "-C",
+                 stage,
+                 "."
+               ],
+               env: [{"COPYFILE_DISABLE", "1"}]
+             ),
+           :ok <- validate_android_beam_archive(archive_path, local_runner),
            {:ok, archive} <- payload_archive_identity(archive_path),
            {:ok, dist_snapshot} <- payload_dist_snapshot(stage) do
         {:ok,
@@ -2528,7 +2536,8 @@ defmodule MobDev.Deployer do
                    "tar",
                    ["cf", stage_local, "-C", tmp, "."],
                    env: [{"COPYFILE_DISABLE", "1"}]
-                 ) do
+                 ),
+               :ok <- validate_android_beam_archive(stage_local, local_runner) do
             {:ok, [{:file, sentinel} | flag_checks ++ priv_checks]}
           end
         after
@@ -2774,7 +2783,8 @@ defmodule MobDev.Deployer do
              local_runner,
              "stage BEAM files",
              "cp",
-             ["-r", "#{dir}/.", tmp]
+             ["-r", "#{dir}/.", tmp],
+             env: [{"COPYFILE_DISABLE", "1"}]
            ) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
@@ -2805,11 +2815,17 @@ defmodule MobDev.Deployer do
          {:ok, verification_check} <- android_priv_verification_check(priv_dir),
          :ok <- File.mkdir_p(Path.join(tmp, "priv")),
          :ok <-
-           checked_local_command(local_runner, "stage Android priv files", "cp", [
-             "-r",
-             "#{priv_dir}/.",
-             Path.join(tmp, "priv")
-           ]) do
+           checked_local_command(
+             local_runner,
+             "stage Android priv files",
+             "cp",
+             [
+               "-r",
+               "#{priv_dir}/.",
+               Path.join(tmp, "priv")
+             ],
+             env: [{"COPYFILE_DISABLE", "1"}]
+           ) do
       {:ok, [verification_check]}
     else
       false -> {:error, "stage Android priv files failed: directory missing"}
@@ -2820,6 +2836,29 @@ defmodule MobDev.Deployer do
 
   defp stage_android_priv(_tmp, _priv_dir, _local_runner),
     do: {:error, "stage Android priv files failed: invalid directory"}
+
+  defp validate_android_beam_archive(archive_path, local_runner) do
+    opts = [stderr_to_stdout: true, env: [{"COPYFILE_DISABLE", "1"}]]
+
+    case local_runner.("tar", ["tf", archive_path], opts) do
+      {listing, 0}
+      when is_binary(listing) and byte_size(listing) <= @max_android_archive_listing_bytes ->
+        if apple_double_archive_member?(listing) do
+          {:error, "BEAM archive contains forbidden metadata sidecars"}
+        else
+          :ok
+        end
+
+      _failure ->
+        {:error, "Could not inspect immutable BEAM archive"}
+    end
+  end
+
+  defp apple_double_archive_member?(listing) do
+    listing
+    |> String.split("\n", trim: true)
+    |> Enum.any?(fn member -> String.starts_with?(Path.basename(member), "._") end)
+  end
 
   defp android_priv_verification_check(priv_dir) do
     safe_file =
