@@ -99,6 +99,23 @@ mix test --exclude integration # skip the device-dependent ones
   NOT `File.cwd!() <> "/mix.exs"`. Under `test_project`, disk reads
   see mob_dev's own mix.exs (wrong app). Falls back to the legacy
   on-disk read only when Igniter has no mix.exs source.
+- **`mix mob.adopt` is the install-into-existing-Phoenix task** (Igniter,
+  like `mob.enable`). The orchestrator (`Mix.Tasks.Mob.Adopt`) gates on
+  `MobDev.AdoptGuard.check/2` then composes the sub-installers
+  `mob.adopt.{deps,bridge,screen,mob_app,mob_exs,native,finalize}` — each a
+  task module under `lib/mix/tasks/mob/adopt/`. Pre-1.0 it *refuses* (adds
+  Igniter issues, no file changes) on unblessed shapes; widen the guard, not
+  the silent-proceed path. Shared Elixir-source content + LV-bridge patches
+  live in `MobDev.Adopt.Patcher`; assigns / dep-resolution / Pythonx wiring
+  in `MobDev.Adopt.Generator`. **The native Android/iOS trees come from
+  mob_new's `priv/templates/mob.new/`** — `Generator.templates_root/1`
+  resolves a `:mob_new` dep, then `$MOB_NEW_DIR`, then `~/code/mob_new`. Both
+  `Adopt.{Patcher,Generator}` are duplicated from mob_new's
+  `LiveViewPatcher` / `ProjectGenerator` (mob_new is a self-contained
+  archive, can't depend on mob_dev); Phase 5 of `build_system_migration.md`
+  reunifies them. See `decisions/2026-06-19-mob-adopt-lives-in-mob_dev.md`.
+  `MobDev.AdoptGuard.check/2` / `mode_from/1` and the `Adopt.Patcher` /
+  `Adopt.Generator` helpers are public for testing — don't privatise.
 
 ## Public-but-undocumented seams
 
@@ -106,11 +123,47 @@ A few helpers are public specifically to enable testing (the parsing and
 narrowing functions). Don't make them private:
 
 - `Discovery.Android.parse_devices_output/1`
-- `Discovery.IOS.parse_simctl_json/1`, `parse_simctl_text/1`, `parse_runtime_version/1`
+- `Discovery.IOS.parse_simctl_json/1`, `parse_simctl_text/1`, `parse_runtime_version/1`,
+  `build_simctl_launch_args/2`, `restart_app_physical/3`, and
+  `build_devicectl_launch_args/2`
 - `OtpDownloader.valid_otp_dir?/2`, `ios_device_extras_present?/1`
 - `PythonAppleSupport.valid_dir?/1`
 - `NativeBuild.narrow_platforms_for_device/2`, `ios_toolchain_available?/0`, `read_sdk_dir/1`, `fallback_entitlements_plist/3`
 - `NativeBuild.pythonx_in_project?/1`, `python_apple_support_env/2`
+- `NativeBuild.build_all_with_outcome/1`, `build_outcome/1`, `build_outcome/2`,
+  `ios_phase_decision/3`, `resolve_android_update_targets/2`,
+  `install_android_updates/3`, `install_and_deliver_android/4`, and
+  `install_and_deliver_android_runtime/8`, `release_android_deploy_lock/2`,
+  `interpret_adb_update/2`, `android_otp_dir_from_abi_probe/4`,
+  `android_package_listed?/2`, `deliver_android_otp_release/7`, and
+  `push_otp_runas/6` (typed sequencing and update-only Android safety seams;
+  the deprecated direct mutators intentionally fail closed)
+- `AndroidDeployLock.valid?/2`, `acquire/4`, `verify_owner/3`, `transition/4`,
+  `release/2`, `status/3`, and `cleanup_committed_tombstone/3` (the shared,
+  exact-target Android mutation lease and its bounded recovery surface)
+- `HotPush.prepare/1`, `push_prepared/2`, `push_prepared/3`,
+  `validate_prepared_snapshot/1`, and `push_prepared_fenced/3` (immutable BEAM
+  snapshot and lease-fenced RPC seams; raw Android pushes intentionally reject)
+- `Mix.Tasks.Mob.DeployLock.inspect_or_cleanup/4` (hermetic task decision seam;
+  production still requires an explicit exact `--device`)
+- `Deployer.collect_android_beam_dirs/0`, `prepare_android_payload/2`,
+  `valid_android_payload?/2`, `cleanup_android_payload/1`, and
+  `deploy_all_with_lease/1`, `execute_ios_restart/1`, and
+  `interpret_ios_restart_result/1`, `restart_ios_simulator/4`, and
+  `restart_ios_physical/4` (immutable final-pass payload, shared-lease
+  integration, and authoritative iOS restart seams)
+- `Deployer.select_canonical_android_devices/2`,
+  `classify_android_package_probe/2`, `deploy_android_device/4`,
+  `ensure_erts_on_device/3`, `verify_elixir_runtime_version_android/5`,
+  `setup_exqlite_android_runas/4`, `push_beams_android_runas/3`, and
+  `restart_android/3` (exact-target and per-mutation fencing seams; ordinary
+  `--device` matching remains user-friendly)
+- `Mix.Tasks.Mob.Deploy.run/2`, `resolve_target_platforms!/4`, `execute_native_deploy!/6`,
+  `deploy_after_native_build!/3`, `deploy_after_native_build!/4`,
+  `deploy_after_native_build!/5`, `deploy_after_native_build!/6`,
+  `ensure_deploy_succeeded!/1`, and `report_deploy_result!/2` (typed
+  orchestration/result seams)
+- `NativeBuild.__prune_plugin_artifacts__/2` (the plugin-removal prune; ledger-tracked per merge concern)
 - `Enable.inject_pythonx_dep/1`, `inject_pythonx_uv_init_gate/2`, `python_paths_module_template/1`
 - `Emulators.parse_simctl_json/1`, `find_emulator_binary/1`
 - `Provision.diagnose_xcodebuild_failure/1`
@@ -146,9 +199,38 @@ needing the same fan-out behavior. Pin the headline guarantee in
 each task's tests — "personal iPhone + dev emulators + `--all-devices`
 must leave the iPhone alone."
 
-**TODO:** apply this pattern to `mix mob.deploy` (today's `--all-devices`
-deploy can push BEAMs to a personal phone). When that fan-out exists
-or grows, factor `select_devices/3` plus the flag plumbing into a
+Android **native** deploys resolve a non-empty connected serial set (narrowed
+by `--device <id>` when supplied) and run only the data-preserving
+`adb -s <serial> install -r <apk>` update path. They never force-stop first,
+uninstall, or fall back to a clean install. A failed update must prevent the
+final `MobDev.Deployer` pass. Before the first device mutation, freeze and hash
+the APK, OTP archives, BEAM/priv payload, optional exqlite payload, restart
+arguments, and exact canonical serial set. One phase-bound
+`AndroidDeployLock` covers that complete set across native install/OTP work and
+the final BEAM/restart pass. Prove the entire set immediately before every
+mutation, halt later targets on the first failure, and retain the exact lease
+on any ambiguous reply. Only a fully successful final pass may advance to a
+committed phase and release it. Build-only APIs must remain artifact-only and
+must never acquire a device lease or install an APK.
+
+For a mixed native Android+iOS deploy, complete, commit, release, and clean the
+entire Android transaction before beginning the iOS build or install. An exact
+typed `:not_attempted` Android disposition may proceed to iOS; any malformed,
+failed, retained, or ambiguous Android outcome suppresses iOS and fails closed.
+
+Never recover by clearing app data, uninstalling, deleting an active lock, or
+blindly retrying. `mix mob.deploy_lock --device <exact-serial>` is read-only;
+`--cleanup-committed` may remove only one exact record-only tombstone already
+in a committed phase and must prove the final clear state.
+
+Fast Android BEAM deploys use an exact-set shared lease. Distribution is used
+only when every frozen target is already connected; otherwise the entire set
+uses the fenced filesystem/restart path rather than splitting authority.
+
+**TODO:** apply the full physical-device *selection* pattern to the fast
+`mix mob.deploy` BEAM fan-out. Its mutations are now exact-set fenced, but the
+broad selector can still include a personal phone. When that fan-out grows,
+factor `select_devices/3` plus the flag plumbing into a
 shared `MobDev.TaskTargets` (or similar) module so the rules don't
 drift between tasks.
 

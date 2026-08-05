@@ -37,6 +37,48 @@ If the task is trivially small (single-file doc edit, one-line config change)
 and clearly won't conflict with anything, working in-place is acceptable —
 but if in doubt, ask.
 
+## Recurring gotchas — read these before debugging device issues
+
+**iOS sim launches, BEAM dies fast, sim returns to home screen.** Almost
+always a host-port collision with `adb`, not a BEAM bug. When an Android
+device is connected, `adb forward tcp:9100 tcp:9100` binds `127.0.0.1:9100`
+on the Mac. iOS sims share the Mac's network stack, so `MobDev.Tunnel.dist_port(0)
+= 9100` is already taken. The OTP boot exits cleanly on `eaddrinuse` and there
+is no crash report. First diagnostic:
+
+```bash
+lsof -nP -iTCP:9100-9199 -sTCP:LISTEN | grep adb
+```
+
+…and read `Documents/beam_stdout.log` inside the sim's app container — look
+for `Protocol 'inet_tcp': register/listen error: eaddrinuse`. Workaround:
+`mix mob.deploy --device <sim-udid> --dist-port 9200`. Full writeup in
+`guides/troubleshooting.md` ("iOS simulator: BEAM dies silently…"). This
+trap has bitten the iOS sim path several times — Android tooling and iOS
+sims compete for the same `127.0.0.1` namespace; check host-port collisions
+before suspecting sim or BEAM bugs.
+
+**iOS sim stuck on "Starting BEAM…" forever.** Read
+`beam_stdout.log` inside the sim's Documents dir. If you see:
+
+```
+step 2 => {error,{"no such file or directory","elixir.app"}}
+step 5 => {error,undef}
+```
+
+…it's a runtime-path mismatch. `MobDev.Paths.sim_runtime_dir/0` falls back
+to `/tmp/otp-ios-sim` when `ios/build.sh` is missing (zig-based iOS builds),
+but the build syncs OTP + Elixir stdlib to `~/.mob/runtime/ios-sim`. Workaround
+when launching manually:
+
+```bash
+SIMCTL_CHILD_MOB_SIM_RUNTIME_DIR="$HOME/.mob/runtime/ios-sim" \
+  xcrun simctl launch <udid> com.example.<app>
+```
+
+Real fix: `sim_runtime_dir/0` should detect `ios/build.zig` and use
+`default_runtime_dir()` for it, so build and launch agree.
+
 ## TDD is the practice here
 
 Write tests before or alongside new code. Every new function should have
@@ -205,6 +247,10 @@ updating the hash in `otp_downloader.ex`).
 - `lib/mob_dev/icon_generator.ex` — robot avatar generation + platform icon resizing
 - `lib/mix/tasks/mob.new.ex` — `mix mob.new APP_NAME`
 - `lib/mix/tasks/mob.icon.ex` — `mix mob.icon [--source PATH]`
+- `lib/mix/tasks/mob/adopt.ex` — `mix mob.adopt` orchestrator (install Mob into an existing Phoenix project)
+- `lib/mix/tasks/mob/adopt/` — the adopt sub-installers (`deps`, `bridge`, `screen`, `mob_app`, `mob_exs`, `native[/android,/ios]`, `finalize`)
+- `lib/mob_dev/adopt_guard.ex` — `MobDev.AdoptGuard`, the pre-1.0 detect-and-refuse for `mob.adopt`
+- `lib/mob_dev/adopt/patcher.ex` / `lib/mob_dev/adopt/generator.ex` — `MobDev.Adopt.{Patcher,Generator}`, the shared LV-bridge patches + EEx assigns/dep-resolution (duplicated from mob_new; see the adopt ADR)
 - `priv/templates/mob.new/` — EEx templates for generated project files
 
 ## Connecting an IEx session to a running mob app (Mac → device BEAM)
@@ -237,41 +283,39 @@ The cookie defaults to `:mob_secret` (set by `Mob.Dist.ensure_started`
 in your app's `on_start/0`). `--name` (long names) is required when
 the device node uses a numeric host like `@10.0.0.120`.
 
-### Multi-Android limitation (mob_dev current behaviour)
+### Multi-Android — node naming (FIXED 2026-05-28, commit `7497f4b`)
 
-`mob_dev` derives the Android dist node name from the device's IP,
-which is identical (`10.0.2.x`) for every emulator. Two emulators
-both try to register `your_app_android_emulator36x5x10x0` in EPMD
-and the second fails with `eaddrinuse`. Symptom in
-`mix mob.connect` output:
+`mob_dev` now derives the Android dist node-name suffix from the device
+**serial** (matching what `Mob.Dist` actually registers), not the IP.
+Emulators get distinct suffixes like `emulator_5554` / `emulator_5556`,
+so two emulators no longer collide in EPMD. The bug was in
+`discovery/android.ex` `enrich/1` — it had a duplicated half-implementation
+of `device_node_suffix/1` that was IP-based, while the correct serial-based
+helper already existed and was used in `restart_app/4`. See ADR
+`decisions/2026-05-28-android-node-name-by-serial.md`.
 
-```
-sdk_gphone64_arm64: timed out waiting for your_app_android_emulator36x5x10x0@127.0.0.1
-```
+Physical (USB/Wi-Fi) Android is unchanged: still keyed off `ro.serialno`.
+iOS untouched.
 
-Workarounds:
-1. Only have one emulator running.
-2. Pick the emulator you care about and verify the other side via
-   `adb logcat`.
+### Dist ports are serial-derived (FIXED 0.6.7, 2026-06-18)
 
-### Fixing adb-forward port mismatch
+Dist ports are no longer assigned by per-run index (which made *every*
+project's first device claim 9100 → cross-project collisions in the one
+shared Mac EPMD → silent timeouts). `Tunnel.serial_base_port/1` maps a
+device serial to a stable port in `9100..9899` (crc32 hash), bumped past
+any port a live node/forward already holds (`assign_dist_port/2`). The
+device-side BEAM listens on that same port (via `MOB_DIST_PORT`), so the
+forward is 1:1 and EPMD's broadcast matches. `setup` also removes the
+device's own stale forwards first. A given phone always gets the same
+unique port across runs/projects, and deploy + connect agree on it.
 
-`mob_dev` assigns dist ports by index (`9100` for the first device,
-`9101` for the second, …) but EPMD broadcasts the *device-side*
-port (always `9100`). When EPMD says "node X is at port 9100",
-your IEx connects to `localhost:9100` — which may be an `adb
-forward` to a different device, or to nothing. Symptom:
-
-```elixir
-Node.connect(:"your_app_android_<suffix>@127.0.0.1")
-#=> false
-```
-
-Repoint `localhost:9100` at the device whose BEAM you want:
+If `mix mob.connect` still fails, it now tells you *why* (app not running /
+Standby-killed, dist not registered, port mismatch, no forward, cookie
+mismatch) instead of a bare "timed out". To inspect by hand:
 
 ```bash
-adb forward --list                           # see what's there
-adb -s <serial> forward tcp:9100 tcp:9100    # 9100 host → 9100 device
+epmd -names           # registered nodes + their ports
+adb forward --list    # host→device forwards (should be 1:1, no dupes)
 ```
 
 For physical-device-on-Wi-Fi targets (iPhone, real Android), the
@@ -313,3 +357,27 @@ Write small named functions in `<your_app>.IexHelpers`, push with
 `mix mob.deploy`, call by RPC. That keeps the Mac-side script
 minimal and debuggable, and the helpers double as documentation
 of the operations you actually need.
+
+---
+
+## Decision log
+
+Non-obvious decisions — tradeoffs, workarounds, conventions, "why we chose X
+over Y" — go in `decisions/`, **one file per decision**:
+
+    decisions/YYYY-MM-DD-short-slug.md
+
+Each file is a lightweight ADR:
+
+    # <Title>
+    - Date: YYYY-MM-DD
+    - Status: accepted | superseded by <file> | proposed
+    ## Context        — what prompted this
+    ## Decision       — what we chose
+    ## Consequences   — tradeoffs, follow-ups
+
+**Append new files; never edit existing ones.** If a decision changes, add a
+new file and mark the old one `Status: superseded by <new-file>`. One file per
+decision keeps the log conflict-free across parallel agents/worktrees — the
+date-sorted directory listing is the index. Record a decision the moment you
+make a non-obvious call, not later.

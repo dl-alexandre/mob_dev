@@ -66,16 +66,24 @@ defmodule Mix.Tasks.Mob.RegenDriverTab do
   @impl Mix.Task
   def run(args) do
     {opts, _, _} = OptionParser.parse(args, strict: [check: :boolean, format: :string])
-    nifs = resolved_nifs()
     format = parse_format(opts[:format])
 
-    case validate_all(nifs) do
+    # Per-platform: the iOS build has no zig plugin-NIF compile path yet, so a
+    # zig plugin NIF (e.g. Android-only mob_bluetooth) must not land in
+    # driver_tab_ios or the link fails on an unresolved <module>_nif_init.
+    ios_nifs = resolved_nifs(:ios)
+    android_nifs = resolved_nifs(:android)
+
+    case validate_all(android_nifs) do
       :ok -> :ok
       {:error, msg} -> Mix.raise(":static_nifs invalid — #{msg}")
     end
 
-    ios_src = StaticNifs.generate(:ios, nifs, format: format) |> IO.iodata_to_binary()
-    android_src = StaticNifs.generate(:android, nifs, format: format) |> IO.iodata_to_binary()
+    ios_src = StaticNifs.generate(:ios, ios_nifs, format: format) |> IO.iodata_to_binary()
+
+    android_src =
+      StaticNifs.generate(:android, android_nifs, format: format) |> IO.iodata_to_binary()
+
     paths = target_paths(format)
 
     if opts[:check] do
@@ -119,7 +127,18 @@ defmodule Mix.Tasks.Mob.RegenDriverTab do
 
   @doc false
   @spec resolved_nifs() :: [StaticNifs.nif_entry()]
-  def resolved_nifs do
+  def resolved_nifs, do: resolved_nifs(:all)
+
+  @doc false
+  # `platform` filters the *plugin* NIFs to those the platform's build actually
+  # compiles, so the generated table never references a symbol the link can't
+  # find. The iOS build compiles only C plugin NIFs (`-Dplugin_c_nifs`); it has
+  # no zig plugin-NIF path yet, so zig plugin NIFs (e.g. Android-only
+  # mob_bluetooth, whose zig is full of JNI symbols and can't build on iOS) are
+  # excluded from driver_tab_ios. Android compiles both, and `:all` (the
+  # default, used by mob.doctor / project-NIF classification) keeps everything.
+  @spec resolved_nifs(:ios | :android | :all) :: [StaticNifs.nif_entry()]
+  def resolved_nifs(platform) do
     # mob.exs isn't auto-imported by Mix.Config — every other task that
     # reads from it goes through Config.Reader.read! directly. Match that
     # pattern here. Application.get_env stays as a secondary source so
@@ -129,8 +148,41 @@ defmodule Mix.Tasks.Mob.RegenDriverTab do
       MobDev.Config.load_mob_config()
       |> Keyword.get(:static_nifs, Application.get_env(:mob_dev, :static_nifs, []))
 
-    StaticNifs.resolve(user)
+    # Activated plugins contribute their NIFs to the static-NIF table. The
+    # plugin's native source still has to be compiled into the binary by the
+    # build (see android_sources/swift_files); this only adds the table entry.
+    plugin_nifs =
+      MobDev.Plugin.Merge.nifs(MobDev.Plugin.activated())
+      |> reject_uncompiled_plugin_nifs(platform)
+
+    StaticNifs.resolve(user ++ plugin_nifs)
   end
+
+  @doc false
+  # Drops plugin NIFs the platform's build won't compile, so the generated table
+  # never references an uncompiled <module>_nif_init:
+  #   - iOS has no zig plugin-NIF path yet, so `lang: :zig` entries are dropped.
+  #   - Android has no Objective-C runtime, so `lang: :objc` entries are dropped
+  #     (objc is implicitly Apple-only even without an explicit `platform: :ios`).
+  #   - A NIF tagged `platform: :ios | :android` is only compiled on that
+  #     platform (a cross-platform plugin ships a separate iOS + Android source
+  #     for the same module); the other platform drops it. No `:platform` =
+  #     compiled everywhere. `:all` keeps everything.
+  # Public for tests.
+  @spec reject_uncompiled_plugin_nifs([map()], :ios | :android | :all) :: [map()]
+  def reject_uncompiled_plugin_nifs(nifs, :ios) do
+    nifs
+    |> Enum.reject(&(&1[:lang] == :zig))
+    |> Enum.reject(&(&1[:platform] == :android))
+  end
+
+  def reject_uncompiled_plugin_nifs(nifs, :android) do
+    nifs
+    |> Enum.reject(&(&1[:lang] == :objc))
+    |> Enum.reject(&(&1[:platform] == :ios))
+  end
+
+  def reject_uncompiled_plugin_nifs(nifs, _), do: nifs
 
   @doc false
   @spec target_paths() :: %{ios: String.t(), android: String.t()}

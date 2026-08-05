@@ -144,4 +144,103 @@ defmodule MobDev.Discovery.IOSTest do
     result = IOS.list_simulators()
     assert Enum.all?(result, &match?(%Device{}, &1))
   end
+
+  # ── build_simctl_env/2 ───────────────────────────────────────────────────────
+  # Pure-function helper extracted from launch_app/3 so the override surface
+  # is unit-testable without spawning simctl. Covers the `mix mob.deploy
+  # --node-suffix X --dist-port N` plumbing — once those reach IOS.launch_app
+  # they must come out as the right SIMCTL_CHILD_* vars (mob_beam.m strips
+  # the prefix at startup, so the child process sees MOB_NODE_SUFFIX /
+  # MOB_DIST_PORT directly).
+
+  describe "build_simctl_env/2" do
+    test "always emits MOB_DIST_PORT (default 9100) and MOB_SIM_RUNTIME_DIR" do
+      env = IOS.build_simctl_env([], "/tmp/runtime")
+      assert {"SIMCTL_CHILD_MOB_DIST_PORT", "9100"} in env
+      assert {"SIMCTL_CHILD_MOB_SIM_RUNTIME_DIR", "/tmp/runtime"} in env
+    end
+
+    test "explicit :dist_port overrides the default" do
+      env = IOS.build_simctl_env([dist_port: 9120], "/tmp/runtime")
+      assert {"SIMCTL_CHILD_MOB_DIST_PORT", "9120"} in env
+      refute {"SIMCTL_CHILD_MOB_DIST_PORT", "9100"} in env
+    end
+
+    test "omits MOB_NODE_SUFFIX when :node_suffix is nil (auto-derive in mob_beam.m)" do
+      env = IOS.build_simctl_env([], "/tmp/runtime")
+      keys = Enum.map(env, fn {k, _} -> k end)
+      refute "SIMCTL_CHILD_MOB_NODE_SUFFIX" in keys
+    end
+
+    test "omits MOB_NODE_SUFFIX when :node_suffix is the empty string" do
+      env = IOS.build_simctl_env([node_suffix: ""], "/tmp/runtime")
+      keys = Enum.map(env, fn {k, _} -> k end)
+      refute "SIMCTL_CHILD_MOB_NODE_SUFFIX" in keys
+    end
+
+    test "emits MOB_NODE_SUFFIX when :node_suffix is a non-empty string" do
+      env = IOS.build_simctl_env([node_suffix: "alt"], "/tmp/runtime")
+      assert {"SIMCTL_CHILD_MOB_NODE_SUFFIX", "alt"} in env
+    end
+
+    test "passes node_suffix verbatim (no sanitisation at this layer)" do
+      env = IOS.build_simctl_env([node_suffix: "Has-Dashes_And_Underscores"], "/tmp/runtime")
+      assert {"SIMCTL_CHILD_MOB_NODE_SUFFIX", "Has-Dashes_And_Underscores"} in env
+    end
+
+    test "combines :dist_port + :node_suffix overrides cleanly" do
+      env = IOS.build_simctl_env([dist_port: 9120, node_suffix: "alt"], "/tmp/runtime")
+      assert {"SIMCTL_CHILD_MOB_DIST_PORT", "9120"} in env
+      assert {"SIMCTL_CHILD_MOB_NODE_SUFFIX", "alt"} in env
+    end
+  end
+
+  describe "build_simctl_launch_args/2" do
+    test "launch atomically terminates an existing simulator process" do
+      assert IOS.build_simctl_launch_args("SIM-UDID", "com.example.app") == [
+               "simctl",
+               "launch",
+               "--terminate-running-process",
+               "SIM-UDID",
+               "com.example.app"
+             ]
+    end
+  end
+
+  describe "physical app-scoped restart" do
+    test "uses one atomic launch for the exact target and never enumerates or terminates unrelated apps" do
+      parent = self()
+
+      runner = fn executable, args, opts ->
+        send(parent, {:command, executable, args, opts})
+        {"launched", 0}
+      end
+
+      assert IOS.restart_app_physical("PHONE-UDID", "com.example.app", runner) ==
+               {"launched", 0}
+
+      assert_received {:command, "xcrun", args, [stderr_to_stdout: true]}
+
+      assert args == [
+               "devicectl",
+               "device",
+               "process",
+               "launch",
+               "--device",
+               "PHONE-UDID",
+               "--terminate-existing",
+               "com.example.app"
+             ]
+
+      refute "terminate" in args
+      refute "--pid" in args
+      refute_received {:command, _executable, _args, _opts}
+    end
+
+    test "returns the exact runner result for authoritative validation" do
+      assert IOS.restart_app_physical("PHONE-UDID", "com.example.app", fn _, _, _ ->
+               {"private output", 17}
+             end) == {"private output", 17}
+    end
+  end
 end

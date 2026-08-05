@@ -167,4 +167,53 @@ defmodule Mix.Tasks.Mob.RegenDriverTabTest do
   defp capture_run(args) do
     ExUnit.CaptureIO.capture_io(fn -> RegenDriverTab.run(args) end)
   end
+
+  describe "reject_uncompiled_plugin_nifs/2" do
+    @c_nif %{module: :mob_location_nif, native_dir: "/x", lang: :c}
+    # a plugin NIF with no :lang defaults to C
+    @default_nif %{module: :mob_photos_nif, native_dir: "/y"}
+    @zig_nif %{module: :mob_bluetooth_nif, native_dir: "/z", lang: :zig}
+
+    test ":ios drops zig plugin NIFs (no iOS zig compile path) but keeps C ones" do
+      nifs = [@c_nif, @default_nif, @zig_nif]
+      kept = RegenDriverTab.reject_uncompiled_plugin_nifs(nifs, :ios)
+      assert @c_nif in kept
+      assert @default_nif in kept
+      refute @zig_nif in kept
+    end
+
+    test ":android and :all keep C and zig plugin NIFs (both langs compile there)" do
+      nifs = [@c_nif, @default_nif, @zig_nif]
+      assert RegenDriverTab.reject_uncompiled_plugin_nifs(nifs, :android) == nifs
+      assert RegenDriverTab.reject_uncompiled_plugin_nifs(nifs, :all) == nifs
+    end
+
+    @objc_nif %{module: :perm_nif, native_dir: "/o", lang: :objc}
+
+    test ":android drops objc plugin NIFs (no Android Obj-C runtime), iOS/:all keep them" do
+      nifs = [@c_nif, @objc_nif, @zig_nif]
+      refute @objc_nif in RegenDriverTab.reject_uncompiled_plugin_nifs(nifs, :android)
+      assert @objc_nif in RegenDriverTab.reject_uncompiled_plugin_nifs(nifs, :ios)
+      assert @objc_nif in RegenDriverTab.reject_uncompiled_plugin_nifs(nifs, :all)
+    end
+
+    @ios_only %{module: :mob_location_nif, native_dir: "/i", lang: :c, platform: :ios}
+    @android_only %{module: :mob_location_nif, native_dir: "/a", lang: :zig, platform: :android}
+
+    test "platform-tagged NIFs only survive on their own platform" do
+      nifs = [@ios_only, @android_only, @default_nif]
+
+      ios = RegenDriverTab.reject_uncompiled_plugin_nifs(nifs, :ios)
+      assert @ios_only in ios
+      assert @default_nif in ios
+      refute @android_only in ios
+
+      android = RegenDriverTab.reject_uncompiled_plugin_nifs(nifs, :android)
+      assert @android_only in android
+      assert @default_nif in android
+      refute @ios_only in android
+
+      assert RegenDriverTab.reject_uncompiled_plugin_nifs(nifs, :all) == nifs
+    end
+  end
 end

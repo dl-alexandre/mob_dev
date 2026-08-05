@@ -466,26 +466,72 @@ defmodule MobDev.Discovery.IOS do
   @doc """
   Launches the app on a booted simulator.
 
-  Passes two env vars through to the simulator app via `simctl`'s
-  `SIMCTL_CHILD_*` mechanism (the prefix is stripped before delivery):
+  Passes env vars through to the simulator app via `simctl`'s
+  `SIMCTL_CHILD_*` mechanism (the prefix is stripped before delivery
+  to the child process):
 
     * `MOB_DIST_PORT`        — Erlang dist listen port
-    * `MOB_SIM_RUNTIME_DIR`  — directory the OTP runtime was written to,
-      so `mob_beam.m` reads from the same place `ios/build.sh` wrote.
-      Resolved by `MobDev.Paths.sim_runtime_dir/1`.
+    * `MOB_NODE_SUFFIX`      — appended to the BEAM node name. When
+      absent, `mob_beam.m` falls back to deriving a suffix from
+      `SIMULATOR_UDID` so concurrent sims still get unique names.
+    * `MOB_SIM_RUNTIME_DIR`  — directory the OTP runtime was written
+      to; `mob_beam.m` reads from the same place `ios/build.sh` wrote.
+
+  Options:
+
+    * `:dist_port`    — pin the dist listen port (default `9100`).
+    * `:node_suffix`  — override the BEAM node-name suffix. `nil` lets
+      `mob_beam.m` auto-derive from `SIMULATOR_UDID`.
   """
   @spec launch_app(String.t(), String.t(), keyword()) :: {String.t(), non_neg_integer()}
   def launch_app(udid, bundle_id, opts \\ []) do
-    dist_port = Keyword.get(opts, :dist_port, 9100)
     runtime_dir = MobDev.Paths.sim_runtime_dir()
+    env = build_simctl_env(opts, runtime_dir)
 
-    System.cmd("xcrun", ["simctl", "launch", udid, bundle_id],
+    System.cmd("xcrun", build_simctl_launch_args(udid, bundle_id),
       stderr_to_stdout: true,
-      env: [
-        {"SIMCTL_CHILD_MOB_DIST_PORT", to_string(dist_port)},
-        {"SIMCTL_CHILD_MOB_SIM_RUNTIME_DIR", runtime_dir}
-      ]
+      env: env
     )
+  end
+
+  @doc false
+  @spec build_simctl_launch_args(String.t(), String.t()) :: [String.t()]
+  def build_simctl_launch_args(udid, bundle_id)
+      when is_binary(udid) and is_binary(bundle_id) do
+    ["simctl", "launch", "--terminate-running-process", udid, bundle_id]
+  end
+
+  @doc """
+  Builds the `SIMCTL_CHILD_*` env-var list `launch_app/3` passes to
+  simctl. Extracted as a pure function so the override behaviour can be
+  unit-tested without spawning subprocesses.
+
+  Always emits:
+
+    * `SIMCTL_CHILD_MOB_DIST_PORT`        — `:dist_port` opt, default 9100
+    * `SIMCTL_CHILD_MOB_SIM_RUNTIME_DIR`  — runtime_dir arg
+
+  Conditionally emits:
+
+    * `SIMCTL_CHILD_MOB_NODE_SUFFIX`      — only when `:node_suffix` is a
+      non-empty string. nil / "" → mob_beam.m auto-derives from
+      SIMULATOR_UDID.
+  """
+  @spec build_simctl_env(keyword(), String.t()) :: [{String.t(), String.t()}]
+  def build_simctl_env(opts, runtime_dir) do
+    dist_port = Keyword.get(opts, :dist_port, 9100)
+    node_suffix = Keyword.get(opts, :node_suffix)
+
+    base = [
+      {"SIMCTL_CHILD_MOB_DIST_PORT", to_string(dist_port)},
+      {"SIMCTL_CHILD_MOB_SIM_RUNTIME_DIR", runtime_dir}
+    ]
+
+    if node_suffix && node_suffix != "" do
+      base ++ [{"SIMCTL_CHILD_MOB_NODE_SUFFIX", node_suffix}]
+    else
+      base
+    end
   end
 
   @spec terminate_app(String.t(), String.t()) :: {String.t(), non_neg_integer()}
@@ -494,72 +540,41 @@ defmodule MobDev.Discovery.IOS do
   end
 
   @doc """
-  Restarts the app on a physical iOS device via xcrun devicectl.
-  Kills any other user-installed app first (they all share EPMD port 4369 and
-  only one can run at a time), then launches the target app fresh.
+  Restarts only the target app on a physical iOS device via xcrun devicectl.
+  `--terminate-existing` atomically replaces an existing instance of that exact
+  bundle without terminating unrelated user applications.
   """
   @spec restart_app_physical(String.t(), String.t()) :: {String.t(), non_neg_integer()}
   def restart_app_physical(udid, bundle_id) do
-    kill_other_user_apps_physical(udid, bundle_id)
+    restart_app_physical(udid, bundle_id, &System.cmd/3)
+  end
 
-    # --terminate-existing kills any remaining instance of *this* app atomically.
-    System.cmd(
+  @doc false
+  @spec restart_app_physical(String.t(), String.t(), function()) ::
+          {String.t(), non_neg_integer()}
+  def restart_app_physical(udid, bundle_id, runner)
+      when is_binary(udid) and is_binary(bundle_id) and is_function(runner, 3) do
+    runner.(
       "xcrun",
-      [
-        "devicectl",
-        "device",
-        "process",
-        "launch",
-        "--device",
-        udid,
-        "--terminate-existing",
-        bundle_id
-      ],
+      build_devicectl_launch_args(udid, bundle_id),
       stderr_to_stdout: true
     )
   end
 
-  # Kill any user-installed app that is not `except_bundle`.
-  # User apps run from /private/var/containers/Bundle/Application/.
-  # All physical-device Mob apps share in-process EPMD on port 4369, so only
-  # one can run at a time. We kill the others before launching to avoid the
-  # EADDRINUSE crash that would otherwise prevent BEAM from starting.
-  defp kill_other_user_apps_physical(udid, except_bundle) do
-    {out, 0} =
-      System.cmd("xcrun", ["devicectl", "device", "info", "processes", "--device", udid],
-        stderr_to_stdout: true
-      )
-
-    out
-    |> String.split("\n")
-    |> Enum.flat_map(fn line ->
-      case Regex.run(Regex.compile!("^\\s*(\\d+)\\s+(.+Bundle/Application/.+\\.app/.+)$"), line) do
-        [_, pid_str, _path] -> [String.to_integer(pid_str)]
-        _ -> []
-      end
-    end)
-    |> Enum.each(fn pid ->
-      System.cmd(
-        "xcrun",
-        [
-          "devicectl",
-          "device",
-          "process",
-          "terminate",
-          "--device",
-          udid,
-          "--pid",
-          to_string(pid),
-          "--kill"
-        ],
-        stderr_to_stdout: true
-      )
-    end)
-
-    _ = except_bundle
-    :ok
-  rescue
-    _ -> :ok
+  @doc false
+  @spec build_devicectl_launch_args(String.t(), String.t()) :: [String.t()]
+  def build_devicectl_launch_args(udid, bundle_id)
+      when is_binary(udid) and is_binary(bundle_id) do
+    [
+      "devicectl",
+      "device",
+      "process",
+      "launch",
+      "--device",
+      udid,
+      "--terminate-existing",
+      bundle_id
+    ]
   end
 
   @doc """

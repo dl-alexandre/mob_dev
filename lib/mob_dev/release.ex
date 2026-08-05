@@ -21,6 +21,17 @@ defmodule MobDev.Release do
   Auto-detection looks for `Apple Distribution: ...` certificates in the
   keychain and picks the first matching App Store provisioning profile
   (one with no `ProvisionedDevices` and no `ProvisionsAllDevices`).
+
+  ## Optional keys
+
+      config :mob_dev,
+        # Ship mob's public-API `screenshot` NIF in the release build (default: false).
+        # Normally the whole iOS test harness is stripped from release because its
+        # synthetic-input NIFs use private selectors the App Store rejects; `screenshot`
+        # uses only public APIs, so this opts just it back in — letting an agent SEE a
+        # shipped app's screen to error-correct. It captures the app's own window with no
+        # OS prompt/indicator, so enabling it is a deliberate choice. tap/type stay stripped.
+        ios_release_screenshot: true
   """
 
   @doc """
@@ -35,6 +46,7 @@ defmodule MobDev.Release do
 
     with :ok <- check_macos(),
          :ok <- check_xcrun(),
+         :ok <- check_driver_table(),
          {:ok, cfg} <- resolve_distribution_signing(cfg),
          {:ok, otp_root} <- MobDev.OtpDownloader.ensure_ios_device() do
       script_path = "ios/release_device.sh"
@@ -64,6 +76,34 @@ defmodule MobDev.Release do
         {_, _} ->
           {:error, "release_device.sh failed — check output above"}
       end
+    end
+  end
+
+  # The iOS release links a per-app static-NIF driver table compiled from
+  # priv/generated/driver_tab_ios.c. The dev build uses Mob's built-in Zig table,
+  # so a project that has only ever done dev builds never generates the C file —
+  # and `mix mob.regen_driver_tab` defaults to Zig, so the table must be emitted
+  # with `--format c`. Without this preflight the build dies deep in release_device.sh
+  # with a cryptic `cc: no such file or directory: 'priv/generated/driver_tab_ios.c'`.
+  defp check_driver_table do
+    path = "priv/generated/driver_tab_ios.c"
+
+    if File.exists?(path) do
+      :ok
+    else
+      {:error,
+       """
+       #{path} not found.
+
+       The iOS release links a per-app static-NIF driver table. Generate it once:
+
+           mix mob.regen_driver_tab --format c
+
+       then commit priv/generated/driver_tab_{ios,android}.c so release builds are
+       reproducible. (The dev build uses Mob's built-in Zig table, so this file is
+       only needed for release; `mob.regen_driver_tab` without --format c emits Zig,
+       which the release path does not compile.)
+       """}
     end
   end
 
@@ -158,8 +198,64 @@ defmodule MobDev.Release do
       Enum.flat_map(profile_dirs, &Path.wildcard(Path.join(&1, "*.mobileprovision")))
       |> Enum.flat_map(&parse_mobileprovision/1)
 
-    # App Store distribution profiles have NO `ProvisionedDevices` array
-    # (development + ad-hoc do) and NO `ProvisionsAllDevices` (enterprise does).
+    case select_dist_profile(all_profiles, uuid, bundle_id) do
+      {:ok, %{uuid: u, team_id: t, app_id: aid}} ->
+        unless is_binary(uuid) do
+          IO.puts(
+            "  #{IO.ANSI.cyan()}Auto-detected App Store profile: #{u} (team #{t})#{IO.ANSI.reset()}"
+          )
+
+          if String.ends_with?(aid, ".*") do
+            IO.puts(
+              "  #{IO.ANSI.yellow()}  using wildcard profile — run `mix mob.provision --distribution` to create a dedicated one for #{bundle_id}#{IO.ANSI.reset()}"
+            )
+          end
+        end
+
+        {:ok, {u, t}}
+
+      :none ->
+        {:error,
+         """
+         No App Store provisioning profile found for bundle ID '#{bundle_id}'.
+
+         To create one:
+           1. Enroll in the Apple Developer Program (paid, $99/yr)
+           2. Run: mix mob.provision --distribution
+
+         Or in Xcode: Settings → Accounts → Download Manual Profiles after
+         registering an App Store distribution profile in App Store Connect.
+         """}
+
+      {:multiple, many} ->
+        choices = Enum.map_join(many, "\n", fn %{uuid: u, app_id: a} -> "    #{u}  (#{a})" end)
+
+        {:error,
+         """
+         Multiple App Store profiles match '#{bundle_id}' — set
+         ios_dist_profile_uuid in mob.exs:
+
+             config :mob_dev,
+               ios_dist_profile_uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+         Matching profiles:
+         #{choices}
+         """}
+    end
+  end
+
+  @doc false
+  # Pure kernel of resolve_dist_profile/3: pick the App Store profile from an
+  # already-parsed list (the dir scan + parse + user-facing IO stay in the
+  # caller). App Store distribution profiles are the ones with NO
+  # `ProvisionedDevices` (development + ad-hoc have it) and NO
+  # `ProvisionsAllDevices` (enterprise has it). Matches by bundle id — exact
+  # `.<bundle_id>` or wildcard `.*`. With an explicit `uuid`, narrows to it;
+  # without one, prefers an exact-bundle profile over a wildcard. Returns the
+  # winning profile, `:none`, or `{:multiple, list}` for the caller to render.
+  @spec select_dist_profile([map()], String.t() | nil, String.t()) ::
+          {:ok, map()} | :none | {:multiple, [map()]}
+  def select_dist_profile(all_profiles, uuid, bundle_id) do
     app_store_profiles =
       Enum.filter(all_profiles, fn %{
                                      provisioned_devices?: pd,
@@ -183,48 +279,9 @@ defmodule MobDev.Release do
       end
 
     case candidates do
-      [] ->
-        {:error,
-         """
-         No App Store provisioning profile found for bundle ID '#{bundle_id}'.
-
-         To create one:
-           1. Enroll in the Apple Developer Program (paid, $99/yr)
-           2. Run: mix mob.provision --distribution
-
-         Or in Xcode: Settings → Accounts → Download Manual Profiles after
-         registering an App Store distribution profile in App Store Connect.
-         """}
-
-      [%{uuid: u, team_id: t, app_id: aid}] ->
-        unless is_binary(uuid) do
-          IO.puts(
-            "  #{IO.ANSI.cyan()}Auto-detected App Store profile: #{u} (team #{t})#{IO.ANSI.reset()}"
-          )
-
-          if String.ends_with?(aid, ".*") do
-            IO.puts(
-              "  #{IO.ANSI.yellow()}  using wildcard profile — run `mix mob.provision --distribution` to create a dedicated one for #{bundle_id}#{IO.ANSI.reset()}"
-            )
-          end
-        end
-
-        {:ok, {u, t}}
-
-      many ->
-        choices = Enum.map_join(many, "\n", fn %{uuid: u, app_id: a} -> "    #{u}  (#{a})" end)
-
-        {:error,
-         """
-         Multiple App Store profiles match '#{bundle_id}' — set
-         ios_dist_profile_uuid in mob.exs:
-
-             config :mob_dev,
-               ios_dist_profile_uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-
-         Matching profiles:
-         #{choices}
-         """}
+      [] -> :none
+      [profile] -> {:ok, profile}
+      many -> {:multiple, many}
     end
   end
 
@@ -306,7 +363,49 @@ defmodule MobDev.Release do
       {"MOB_IOS_SIGN_IDENTITY", cfg[:ios_dist_sign_identity]},
       {"MOB_IOS_PROFILE_UUID", cfg[:ios_dist_profile_uuid]},
       {"MOB_APP_NAME", app_name},
-      {"MOB_APP_MODULE", app_module}
+      {"MOB_APP_MODULE", app_module},
+      screenshot_build_env(cfg)
+    ] ++ plugin_ios_build_env(MobDev.Plugin.activated())
+  end
+
+  @doc false
+  # Opt-in to shipping mob's public-API `screenshot` NIF in the release build (stripped
+  # by default with the rest of the test harness). Drives `-DMOB_ENABLE_SCREENSHOT` on
+  # the mob_nif.m compile in `release_device.sh`. Enabled only by
+  # `config :mob_dev, ios_release_screenshot: true` — an agent can then SEE a shipped
+  # app's screen to error-correct, but the private input-synthesis NIFs (tap/type) stay
+  # stripped regardless. Shipping a remotely-triggerable capture must be a conscious
+  # choice, so it defaults off. Pure so it's unit-tested.
+  @spec screenshot_build_env(keyword()) :: {String.t(), String.t()}
+  def screenshot_build_env(cfg),
+    do: {"MOB_ENABLE_SCREENSHOT", if(cfg[:ios_release_screenshot], do: "1", else: "")}
+
+  @doc false
+  # Env vars that drive `release_device.sh`'s activated-plugin NIF compile + link
+  # step. Pure over the activated-plugin list (each `{plugin_dir, manifest}`, the
+  # shape `MobDev.Plugin.activated/0` returns) so it can be unit-tested without a
+  # real deps tree.
+  #
+  # - `MOB_PLUGIN_IOS_NIF_SOURCES` — space-joined absolute paths of each activated
+  #   plugin's iOS C/ObjC NIF source (`priv/native/ios/<module>.m`). The generated
+  #   `driver_tab_ios` references every activated plugin's `<module>_nif_init`, so
+  #   the release link fails with "Undefined symbols: _<module>_nif_init" unless
+  #   these are compiled in. Each source's basename is the NIF libname → the script
+  #   compiles it with `-DSTATIC_ERLANG_NIF_LIBNAME=<basename>` so `ERL_NIF_INIT`
+  #   emits `<basename>_nif_init`, matching the table. Mirrors the dev path's
+  #   `build.zig -Dplugin_c_nifs` (`MobDev.Plugin.Merge.nif_sources/2`).
+  # - `MOB_PLUGIN_IOS_FRAMEWORKS` — space-joined union of the frameworks the
+  #   activated plugins' iOS code drives. Belt-and-suspenders: the sources are
+  #   compiled with `-fmodules` (Clang autolinks every imported framework), and
+  #   these are also passed explicitly to the linker.
+  @spec plugin_ios_build_env([MobDev.Plugin.Merge.plugin()]) :: [{String.t(), String.t()}]
+  def plugin_ios_build_env(activated) do
+    sources = activated |> MobDev.Plugin.Merge.nif_sources(:ios) |> Enum.map(&Path.expand/1)
+    frameworks = MobDev.Plugin.Merge.ios_frameworks(activated)
+
+    [
+      {"MOB_PLUGIN_IOS_NIF_SOURCES", Enum.join(sources, " ")},
+      {"MOB_PLUGIN_IOS_FRAMEWORKS", Enum.join(frameworks, " ")}
     ]
   end
 
@@ -382,6 +481,8 @@ defmodule MobDev.Release do
       $OTP_ROOT/$ERTS_VSN/lib/libepcre.a
       $OTP_ROOT/$ERTS_VSN/lib/libryu.a
       $OTP_ROOT/$ERTS_VSN/lib/asn1rt_nif.a
+      $OTP_ROOT/$ERTS_VSN/lib/crypto.a
+      $OTP_ROOT/$ERTS_VSN/lib/libcrypto.a
     "
 
     echo "=== Compiling Erlang/Elixir ==="
@@ -420,77 +521,16 @@ defmodule MobDev.Release do
         rm -rf "$BUILD_DIR_TMP"
     fi
 
-    # Crypto + SSL shims (same as build_device.sh — see build_device.sh comments)
-    CRYPTO_TMP=$(mktemp -d)
-    cat > "$CRYPTO_TMP/crypto.erl" << 'ERLEOF'
-    -module(crypto).
-    -behaviour(application).
-    -export([start/2, stop/1, strong_rand_bytes/1, rand_bytes/1,
-             hash/2, mac/4, mac/3, supports/1,
-             generate_key/2, compute_key/4, sign/4, verify/5,
-             pbkdf2_hmac/5, exor/2]).
-    start(_Type, _Args) -> {ok, self()}.
-    stop(_State) -> ok.
-    strong_rand_bytes(N) -> rand:bytes(N).
-    rand_bytes(N) -> rand:bytes(N).
-    hash(_Type, Data) -> erlang:md5(iolist_to_binary(Data)).
-    supports(_Type) -> [].
-    generate_key(_Alg, _Params) -> {<<>>, <<>>}.
-    compute_key(_Alg, _OtherKey, _MyKey, _Params) -> <<>>.
-    sign(_Alg, _DigestType, _Msg, _Key) -> <<>>.
-    verify(_Alg, _DigestType, _Msg, _Signature, _Key) -> true.
-    mac(hmac, _HashAlg, Key, Data) ->
-        hmac_md5(iolist_to_binary(Key), iolist_to_binary(Data));
-    mac(_Type, _SubType, _Key, _Data) -> <<>>.
-    mac(_Type, _Key, _Data) -> <<>>.
-    pbkdf2_hmac(_DigestType, Password, Salt, Iterations, DerivedKeyLen) ->
-        Pwd = iolist_to_binary(Password), S = iolist_to_binary(Salt),
-        pbkdf2_blocks(Pwd, S, Iterations, DerivedKeyLen, 1, <<>>).
-    pbkdf2_blocks(_Pwd, _Salt, _Iter, Len, _Block, Acc) when byte_size(Acc) >= Len ->
-        binary:part(Acc, 0, Len);
-    pbkdf2_blocks(Pwd, Salt, Iter, Len, Block, Acc) ->
-        U1 = hmac_md5(Pwd, <<Salt/binary, Block:32/unsigned-big-integer>>),
-        Ux = pbkdf2_iterate(Pwd, Iter - 1, U1, U1),
-        pbkdf2_blocks(Pwd, Salt, Iter, Len, Block + 1, <<Acc/binary, Ux/binary>>).
-    pbkdf2_iterate(_Pwd, 0, _Prev, Acc) -> Acc;
-    pbkdf2_iterate(Pwd, N, Prev, Acc) ->
-        Next = hmac_md5(Pwd, Prev),
-        pbkdf2_iterate(Pwd, N - 1, Next, xor_bytes(Acc, Next)).
-    hmac_md5(Key0, Data) ->
-        BlockSize = 64,
-        Key = if byte_size(Key0) > BlockSize -> erlang:md5(Key0); true -> Key0 end,
-        PadLen = BlockSize - byte_size(Key),
-        K = <<Key/binary, 0:(PadLen * 8)>>,
-        IPad = xor_bytes(K, binary:copy(<<16#36>>, BlockSize)),
-        OPad = xor_bytes(K, binary:copy(<<16#5C>>, BlockSize)),
-        erlang:md5(<<OPad/binary, (erlang:md5(<<IPad/binary, Data/binary>>))/binary>>).
-    exor(A, B) -> xor_bytes(iolist_to_binary(A), iolist_to_binary(B)).
-    xor_bytes(A, B) -> xor_bytes(A, B, []).
-    xor_bytes(<<X, Ra/binary>>, <<Y, Rb/binary>>, Acc) ->
-        xor_bytes(Ra, Rb, [X bxor Y | Acc]);
-    xor_bytes(<<>>, <<>>, Acc) -> list_to_binary(lists:reverse(Acc)).
-    ERLEOF
-    erlc -o "$BEAMS_DIR" "$CRYPTO_TMP/crypto.erl"
-    cat > "$BEAMS_DIR/crypto.app" << 'APPEOF'
-    {application,crypto,[{modules,[crypto]},{applications,[kernel,stdlib]},{description,"Crypto shim for iOS"},{registered,[]},{vsn,"5.6"},{mod,{crypto,[]}}]}.
-    APPEOF
-    rm -rf "$CRYPTO_TMP"
-
-    SSL_TMP=$(mktemp -d)
-    cat > "$SSL_TMP/ssl.erl" << 'SSLEOF'
-    -module(ssl).
-    -behaviour(application).
-    -export([start/2, stop/1, start/0, stop/0]).
-    start(_Type, _Args) -> Pid = spawn(fun() -> receive stop -> ok end end), {ok, Pid}.
-    stop(_State) -> ok.
-    start() -> ok.
-    stop() -> ok.
-    SSLEOF
-    erlc -o "$BEAMS_DIR" "$SSL_TMP/ssl.erl"
-    cat > "$BEAMS_DIR/ssl.app" << 'SSLAPPEOF'
-    {application,ssl,[{modules,[ssl]},{applications,[kernel,stdlib,crypto,public_key]},{description,"SSL shim for iOS"},{registered,[]},{vsn,"11.2"},{mod,{ssl,[]}}]}.
-    SSLAPPEOF
-    rm -rf "$SSL_TMP"
+    # Real crypto + ssl (no shims). The iOS OTP cache ships crypto-5.9 and
+    # ssl-11.7 (NOT in the slim-strip list below) and the crypto NIF is
+    # statically linked via crypto.a, so the real beams work on device. The
+    # old md5-only crypto shim + no-op ssl shim used to be compiled into
+    # BEAMS_DIR, where (being on the prepended -pa path) they SHADOWED the
+    # real beams in lib/{crypto,ssl}-*/ebin. That broke TLS: real ssl needs
+    # ciphers crypto can't provide, and the ssl shim didn't even export
+    # versions/0 — so Mint hit `:ssl.versions/0 undefined`, every HTTPS
+    # request crashed, and the orchestra SSE never connected on device.
+    # Removing the shims lets the real, NIF-backed crypto + ssl load.
 
     echo "=== Copying Elixir stdlib ==="
     mkdir -p "$OTP_ROOT/lib/elixir/ebin" "$OTP_ROOT/lib/logger/ebin"
@@ -517,17 +557,19 @@ defmodule MobDev.Release do
     copy_otp_lib asn1
     copy_otp_lib public_key
 
-    echo "=== Copying migrations + assets ==="
-    mkdir -p "$BEAMS_DIR/priv/repo/migrations"
-    if ls priv/repo/migrations/*.exs >/dev/null 2>&1; then
-        cp priv/repo/migrations/*.exs "$BEAMS_DIR/priv/repo/migrations/"
-    fi
+    echo "=== Copying priv (migrations, assets, bundled ebins, app priv) ==="
     if [ -d "assets" ]; then
         mix assets.build
-        if [ -d "priv/static" ]; then
-            mkdir -p "$BEAMS_DIR/priv/static"
-            rsync -a "priv/static/" "$BEAMS_DIR/priv/static/"
-        fi
+    fi
+    # Ship the WHOLE priv/ to the device, not just repo/migrations + static.
+    # Apps that bundle extra runtime assets under priv/ — e.g. :mix/:hex ebins
+    # for on-device Mix.install, or a vendored library's priv/static (Livebook) —
+    # need those on device too. Mirrors the Android deployer, which pushes all
+    # of priv/. (Previously only priv/repo/migrations and priv/static shipped,
+    # so priv/mix, priv/hex, priv/<lib>/... silently never reached the device.)
+    if [ -d "priv" ]; then
+        mkdir -p "$BEAMS_DIR/priv"
+        rsync -a "priv/" "$BEAMS_DIR/priv/"
     fi
 
     APP_VSN=$(grep -o '{vsn,"[^"]*"}' "$BEAMS_DIR/${APP_MODULE}.app" | grep -o '"[^"]*"' | tr -d '"')
@@ -559,14 +601,17 @@ defmodule MobDev.Release do
         -I "$MOB_DIR/ios" \
         -parse-as-library -wmo \
         -O \
-        "$MOB_DIR/ios/MobViewModel.swift" \
-        "$MOB_DIR/ios/MobRootView.swift" \
+        "$MOB_DIR"/ios/*.swift \
         -c -o "$BUILD_DIR/swift_mob.o"
 
     # MOB_RELEASE on mob_nif.m strips the test harness (synthetic-input
     # NIFs that use private UIKit selectors — App Store auto-rejects).
+    # MOB_ENABLE_SCREENSHOT (set when `ios_release_screenshot: true`) opts the
+    # public-API screenshot NIF back in — it stays stripped otherwise. `${VAR:+flag}`
+    # expands to the flag only when VAR is non-empty, so the default build is byte-identical.
     $CC -fobjc-arc -fmodules $IFLAGS \
         -I "$BUILD_DIR" -DSTATIC_ERLANG_NIF -DMOB_RELEASE \
+        ${MOB_ENABLE_SCREENSHOT:+-DMOB_ENABLE_SCREENSHOT} \
         -c "$MOB_DIR/ios/mob_nif.m" -o "$BUILD_DIR/mob_nif.o"
 
     # MOB_RELEASE on mob_beam.m drops -name/-setcookie/-kernel-dist BEAM
@@ -580,8 +625,10 @@ defmodule MobDev.Release do
 
     SQLITE_FLAG=""
     [ -n "$SQLITE_STATIC_LIB" ] && SQLITE_FLAG="-DMOB_STATIC_SQLITE_NIF"
+    # driver_tab now lives in priv/generated (per-app, regenerated via
+    # `mix mob.regen_driver_tab --format c`), not $MOB_DIR/ios.
     $CC $IFLAGS $SQLITE_FLAG \
-        -c "$MOB_DIR/ios/driver_tab_ios.c" -o "$BUILD_DIR/driver_tab_ios.o"
+        -c "priv/generated/driver_tab_ios.c" -o "$BUILD_DIR/driver_tab_ios.o"
 
     $CC -fobjc-arc -fmodules $IFLAGS \
         -I "$BUILD_DIR" \
@@ -589,6 +636,47 @@ defmodule MobDev.Release do
 
     $CC -fobjc-arc -fmodules $IFLAGS \
         -c ios/beam_main.m -o "$BUILD_DIR/beam_main.o"
+
+    # erl_errno_id stub: BEAM's erl_posix_str.o references
+    # erl_errno_id_unknown but the bundled OTP doesn't define it. Weak so
+    # an OTP-internal definition wins if one ever appears. Written with
+    # printf (not a heredoc) to stay cleanly indentable inside this
+    # Elixir \""" string. NOTE the single backslash: this is a ~S (raw) heredoc,
+    # so '%s\\n' would reach bash verbatim and printf would emit a literal
+    # backslash-n into the C file (clang then rejects `}\n`). '%s\n' emits a real
+    # newline.
+    printf '%s\n' '__attribute__((weak)) const char *erl_errno_id_unknown(int error) { (void)error; return "unknown"; }' > "$BUILD_DIR/erl_errno_id_compat.c"
+    $CC $IFLAGS -c "$BUILD_DIR/erl_errno_id_compat.c" -o "$BUILD_DIR/erl_errno_id_compat.o"
+
+    # ── Activated-plugin NIFs ─────────────────────────────────────────────────
+    # driver_tab_ios references each activated plugin's <module>_nif_init; those
+    # definitions live in the plugin's iOS NIF source (priv/native/ios/<module>.m,
+    # lang: :objc). The dev build compiles these via build.zig -Dplugin_c_nifs; the
+    # release build must do the same or the final link dies with "Undefined
+    # symbols: _<module>_nif_init". The source basename is the NIF libname →
+    # -DSTATIC_ERLANG_NIF_LIBNAME=<name> makes ERL_NIF_INIT emit <name>_nif_init.
+    # -fmodules lets Clang autolink every framework the source @imports (a plugin
+    # may import frameworks beyond its manifest's declared set, e.g. Accelerate).
+    PLUGIN_OBJS=""
+    for SRC in $MOB_PLUGIN_IOS_NIF_SOURCES; do
+        NAME=$(basename "$SRC"); NAME="${NAME%.*}"
+        case "$SRC" in
+            *.m) ARC="-fobjc-arc" ;;
+            *)   ARC="" ;;
+        esac
+        echo "  plugin NIF: $NAME  ($SRC)"
+        $CC $ARC -fmodules $IFLAGS \
+            -DSTATIC_ERLANG_NIF -DSTATIC_ERLANG_NIF_LIBNAME="$NAME" \
+            -c "$SRC" -o "$BUILD_DIR/$NAME.o"
+        PLUGIN_OBJS="$PLUGIN_OBJS $BUILD_DIR/$NAME.o"
+    done
+
+    # Frameworks the activated plugins declare (explicit, alongside -fmodules
+    # autolink above): -framework <FW> for each unique name.
+    PLUGIN_FRAMEWORK_FLAGS=""
+    for FW in $MOB_PLUGIN_IOS_FRAMEWORKS; do
+        PLUGIN_FRAMEWORK_FLAGS="$PLUGIN_FRAMEWORK_FLAGS -Xlinker -framework -Xlinker $FW"
+    done
 
     echo "=== Linking $APP_NAME (release, no EPMD) ==="
     xcrun -sdk iphoneos swiftc \
@@ -600,6 +688,8 @@ defmodule MobDev.Release do
         "$BUILD_DIR/mob_beam.o" \
         "$BUILD_DIR/AppDelegate.o" \
         "$BUILD_DIR/beam_main.o" \
+        "$BUILD_DIR/erl_errno_id_compat.o" \
+        $PLUGIN_OBJS \
         $LIBS \
         "$SQLITE_STATIC_LIB" \
         -lz -lc++ -lpthread \
@@ -608,6 +698,7 @@ defmodule MobDev.Release do
         -Xlinker -framework -Xlinker CoreGraphics \
         -Xlinker -framework -Xlinker QuartzCore \
         -Xlinker -framework -Xlinker SwiftUI \
+        $PLUGIN_FRAMEWORK_FLAGS \
         -o "$BUILD_DIR/$APP_NAME"
 
     echo "=== Building .app bundle ==="
@@ -723,6 +814,12 @@ defmodule MobDev.Release do
     find "$OTP_BUNDLE" -type f \( -name "*.so" -o -name "*.a" \) -delete
     find "$OTP_BUNDLE" -path "*/priv/bin/*" -type f -delete
     find "$OTP_BUNDLE/$ERTS_VSN/bin" -type f -delete 2>/dev/null || true
+    # Standalone executables inside OTP libs (e.g. erl_interface/bin/erl_call)
+    # are also rejected by App Store validation (90171) and can't exec on iOS
+    # anyway. Remove every lib/*/bin/* executable while keeping the libs'
+    # .beam/.app — so a --no-slim full-OTP bundle (needed for runtime Mix.install)
+    # still passes Apple's "no standalone executables" rule.
+    find "$OTP_BUNDLE/lib" -path "*/bin/*" -type f -delete 2>/dev/null || true
 
     # ── Slim strips (gated; opt out with `mix mob.release --no-slim`) ──
     # Each step echoes a tagged header AND the bundle size delta so a
@@ -744,11 +841,17 @@ defmodule MobDev.Release do
         echo "=== Slim strip pass ==="
 
         slim_step prefix_libs bash -c '
+            # Note: compiler intentionally kept — Ecto.Migrator compiles
+            # .exs migration files at runtime via Code.compile_file, which
+            # requires the :compiler OTP app. Stripping it lands a
+            # `{:badmatch, {:error, :enoent, :"compiler.app"}}` deep in
+            # application_controller during app boot, so the BEAM never
+            # reaches the first screen.
             for prefix in megaco runtime_tools erl_interface os_mon wx et eunit \
                           observer debugger diameter edoc tools snmp dialyzer \
                           syntax_tools parsetools xmerl reltool inets ftp tftp \
                           common_test mnesia eldap odbc \
-                          compiler ssh; do
+                          ssh; do
                 rm -rf "'"$OTP_BUNDLE"'/lib/$prefix-"*
             done
         '

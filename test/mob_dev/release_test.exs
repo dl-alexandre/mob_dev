@@ -82,6 +82,175 @@ defmodule MobDev.ReleaseTest do
     end
   end
 
+  # The App Store profile selection kernel, extracted from resolve_dist_profile/3
+  # so the pick logic (which is easy to get wrong: dev vs App Store, exact vs
+  # wildcard, uuid narrowing) is testable without a keychain full of profiles.
+  describe "select_dist_profile/3" do
+    @bundle "com.example.app"
+
+    test "excludes development profiles even when the bundle id matches" do
+      # A dev profile has ProvisionedDevices — it must never be picked for App Store.
+      profiles = [profile(provisioned_devices?: true, app_id: "TEAMID.#{@bundle}")]
+      assert Release.select_dist_profile(profiles, nil, @bundle) == :none
+    end
+
+    test "excludes Enterprise profiles (ProvisionsAllDevices)" do
+      profiles = [profile(provisions_all_devices?: true, app_id: "TEAMID.#{@bundle}")]
+      assert Release.select_dist_profile(profiles, nil, @bundle) == :none
+    end
+
+    test "picks the App Store profile whose app id exactly matches the bundle id" do
+      p = profile(uuid: "EXACT", app_id: "TEAMID.#{@bundle}")
+      assert {:ok, ^p} = Release.select_dist_profile([p], nil, @bundle)
+    end
+
+    test "falls back to a wildcard (.*) profile when there is no exact match" do
+      wild = profile(uuid: "WILD", app_id: "TEAMID.*")
+      assert {:ok, ^wild} = Release.select_dist_profile([wild], nil, @bundle)
+    end
+
+    test "prefers an exact-bundle profile over a wildcard when both match" do
+      exact = profile(uuid: "EXACT", app_id: "TEAMID.#{@bundle}")
+      wild = profile(uuid: "WILD", app_id: "TEAMID.*")
+      assert {:ok, ^exact} = Release.select_dist_profile([wild, exact], nil, @bundle)
+    end
+
+    test "with an explicit uuid, narrows to that profile and ignores the rest" do
+      a = profile(uuid: "AAA", app_id: "TEAMID.#{@bundle}")
+      b = profile(uuid: "BBB", app_id: "TEAMID.#{@bundle}")
+      assert {:ok, ^b} = Release.select_dist_profile([a, b], "BBB", @bundle)
+    end
+
+    test "returns :none when the given uuid matches nothing" do
+      p = profile(uuid: "AAA", app_id: "TEAMID.#{@bundle}")
+      assert Release.select_dist_profile([p], "NOPE", @bundle) == :none
+    end
+
+    test "returns :none when no profile matches the bundle id" do
+      p = profile(app_id: "TEAMID.com.other.app")
+      assert Release.select_dist_profile([p], nil, @bundle) == :none
+    end
+
+    test "returns {:multiple, _} when two profiles exactly match and no uuid is set" do
+      a = profile(uuid: "AAA", app_id: "TEAMID.#{@bundle}")
+      b = profile(uuid: "BBB", app_id: "TEAMID.#{@bundle}")
+      assert {:multiple, both} = Release.select_dist_profile([a, b], nil, @bundle)
+      assert Enum.sort_by(both, & &1.uuid) == [a, b]
+    end
+  end
+
+  describe "screenshot_build_env/1" do
+    # Drives -DMOB_ENABLE_SCREENSHOT on the release mob_nif.m compile. Opt-in: the
+    # public-API screenshot NIF ships in release only when the host asks for it.
+    test "opts in when ios_release_screenshot: true" do
+      assert Release.screenshot_build_env(ios_release_screenshot: true) ==
+               {"MOB_ENABLE_SCREENSHOT", "1"}
+    end
+
+    test "off (empty) when the key is false" do
+      assert Release.screenshot_build_env(ios_release_screenshot: false) ==
+               {"MOB_ENABLE_SCREENSHOT", ""}
+    end
+
+    test "off (empty) by default when the key is absent" do
+      assert Release.screenshot_build_env([]) == {"MOB_ENABLE_SCREENSHOT", ""}
+    end
+  end
+
+  describe "plugin_ios_build_env/1" do
+    # The two env vars feed release_device.sh's plugin NIF compile + link loop.
+    # Pure over the activated-plugin list, so the matrix runs without a deps tree.
+
+    test "no activated plugins → empty source + framework strings" do
+      assert Release.plugin_ios_build_env([]) == [
+               {"MOB_PLUGIN_IOS_NIF_SOURCES", ""},
+               {"MOB_PLUGIN_IOS_FRAMEWORKS", ""}
+             ]
+    end
+
+    test "one ObjC plugin → its .m source (absolute) + declared frameworks" do
+      activated = [
+        {"/deps/mob_camera",
+         %{
+           nifs: [
+             %{
+               module: :mob_camera_nif,
+               native_dir: "priv/native/ios",
+               lang: :objc,
+               platform: :ios
+             }
+           ],
+           ios: %{frameworks: ["AVFoundation", "Photos"]}
+         }}
+      ]
+
+      assert [
+               {"MOB_PLUGIN_IOS_NIF_SOURCES", srcs},
+               {"MOB_PLUGIN_IOS_FRAMEWORKS", fws}
+             ] = Release.plugin_ios_build_env(activated)
+
+      assert srcs == "/deps/mob_camera/priv/native/ios/mob_camera_nif.m"
+      assert fws == "AVFoundation Photos"
+    end
+
+    test "multiple plugins → space-joined sources; frameworks de-duped across the union" do
+      activated = [
+        {"/deps/a",
+         %{
+           nifs: [%{module: :a_nif, native_dir: "priv/native/ios", lang: :objc, platform: :ios}],
+           ios: %{frameworks: ["CoreBluetooth", "Foundation"]}
+         }},
+        {"/deps/b",
+         %{
+           nifs: [%{module: :b_nif, native_dir: "priv/native/ios", lang: :objc, platform: :ios}],
+           ios: %{frameworks: ["Foundation", "AVFoundation"]}
+         }}
+      ]
+
+      assert [
+               {"MOB_PLUGIN_IOS_NIF_SOURCES", srcs},
+               {"MOB_PLUGIN_IOS_FRAMEWORKS", fws}
+             ] = Release.plugin_ios_build_env(activated)
+
+      assert srcs == "/deps/a/priv/native/ios/a_nif.m /deps/b/priv/native/ios/b_nif.m"
+      # collect_uniq preserves first-seen order across plugins.
+      assert fws == "CoreBluetooth Foundation AVFoundation"
+    end
+
+    test "an Android-only NIF entry on the same plugin is excluded from iOS sources" do
+      activated = [
+        {"/deps/x",
+         %{
+           nifs: [
+             %{module: :x_nif, native_dir: "priv/native/ios", lang: :objc, platform: :ios},
+             %{module: :x_nif, native_dir: "priv/native/jni", lang: :c, platform: :android}
+           ],
+           ios: %{frameworks: []}
+         }}
+      ]
+
+      assert [{"MOB_PLUGIN_IOS_NIF_SOURCES", srcs}, {"MOB_PLUGIN_IOS_FRAMEWORKS", ""}] =
+               Release.plugin_ios_build_env(activated)
+
+      assert srcs == "/deps/x/priv/native/ios/x_nif.m"
+    end
+  end
+
+  # A parsed-profile map in the shape parse_mobileprovision/1 returns; App Store by
+  # default (no provisioned devices, not provisions-all).
+  defp profile(overrides) do
+    Map.merge(
+      %{
+        uuid: "UUID",
+        team_id: "TEAMID",
+        app_id: "TEAMID.com.example.app",
+        provisioned_devices?: false,
+        provisions_all_devices?: false
+      },
+      Map.new(overrides)
+    )
+  end
+
   # ── Profile XML fixtures ────────────────────────────────────────────────
   # Real .mobileprovision files are CMS-signed binaries with a plist payload
   # wrapped in DER. parse_mobileprovision/1 extracts the plist by string

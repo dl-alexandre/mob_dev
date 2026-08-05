@@ -26,14 +26,24 @@ defmodule MobDev.Connector do
   def connect_all(opts \\ []) do
     cookie = Keyword.get(opts, :cookie, :mob_secret)
 
+    only = opts |> Keyword.get(:only, []) |> List.wrap()
+    platforms = opts |> Keyword.get(:platforms, [:android, :ios]) |> List.wrap()
+
     IO.puts("\n#{color(:cyan)}Scanning for devices...#{color(:reset)}\n")
 
-    devices = discover_all()
+    devices = platforms |> discover_all() |> filter_only(only)
 
     if devices == [] do
-      IO.puts("  #{color(:yellow)}No devices found.#{color(:reset)}")
-      IO.puts("  • Connect an Android device via USB and enable USB debugging")
-      IO.puts("  • Start an iOS simulator in Xcode or via xcrun simctl")
+      if only != [] do
+        IO.puts("  #{color(:yellow)}No devices matched #{Enum.join(only, ", ")}.#{color(:reset)}")
+
+        IO.puts("  • Run `mix mob.connect` with no --only to list all discovered devices")
+      else
+        IO.puts("  #{color(:yellow)}No devices found.#{color(:reset)}")
+        IO.puts("  • Connect an Android device via USB and enable USB debugging")
+        IO.puts("  • Start an iOS simulator in Xcode or via xcrun simctl")
+      end
+
       {[], []}
     else
       print_discovered(devices)
@@ -84,20 +94,41 @@ defmodule MobDev.Connector do
     end
   end
 
-  defp discover_all do
-    android = Android.list_devices()
-    ios = IOS.list_devices()
+  # Only scan the platforms the project targets. An iOS-only Mac (no Android
+  # platform-tools) skips Android discovery entirely — both so it never shells
+  # out to a missing `adb`, and so a plugged-in Android phone for some *other*
+  # project isn't swept into this session.
+  defp discover_all(platforms) do
+    android = if :android in platforms, do: Android.list_devices(), else: []
+    ios = if :ios in platforms, do: IOS.list_devices(), else: []
     android ++ ios
   end
 
+  # Restrict the discovered set to devices whose serial/udid contains any of the
+  # given substrings (case-insensitive). Empty list = no filter (connect to all).
+  @doc false
+  @spec filter_only([Device.t()], [String.t()]) :: [Device.t()]
+  def filter_only(devices, []), do: devices
+
+  def filter_only(devices, patterns) do
+    pats = Enum.map(patterns, &String.downcase/1)
+
+    Enum.filter(devices, fn d ->
+      serial = String.downcase(to_string(d.serial))
+      Enum.any?(pats, &String.contains?(serial, &1))
+    end)
+  end
+
   defp setup_tunnels(devices) do
-    # Track index per platform to assign unique ports
+    # Ports are derived from each device's serial (Tunnel.assign_dist_port/2),
+    # not a per-run index — so they're stable and don't collide across projects.
+    # Sequential so each device's freshly-added forward is visible as "in use"
+    # to the next device's collision check.
     devices
-    |> Enum.with_index()
-    |> Enum.reduce({[], []}, fn {device, idx}, {ok, fail} ->
+    |> Enum.reduce({[], []}, fn device, {ok, fail} ->
       IO.write("  #{device.name || device.serial}  →  tunneling...")
 
-      case Tunnel.setup(device, idx) do
+      case Tunnel.setup(device) do
         {:ok, d} ->
           IO.puts("  #{color(:green)}✓#{color(:reset)}")
           {ok ++ [d], fail}
@@ -139,9 +170,20 @@ defmodule MobDev.Connector do
     :timer.sleep(300)
   end
 
-  defp restart_app(%Device{platform: :android, serial: serial, dist_port: port}) do
+  defp restart_app(%Device{
+         platform: :android,
+         serial: serial,
+         dist_port: port,
+         node_suffix: suffix
+       }) do
     IO.write("  Restarting app on #{serial}...")
-    Android.restart_app(serial, android_package(), @android_activity, dist_port: port)
+    # node_suffix may be nil — Android.restart_app falls back to
+    # device_node_suffix(serial) in that case (auto-derive from serial).
+    Android.restart_app(serial, android_package(), @android_activity,
+      dist_port: port,
+      node_suffix: suffix
+    )
+
     IO.puts(" done")
   end
 
@@ -152,11 +194,13 @@ defmodule MobDev.Connector do
     IO.puts(" done")
   end
 
-  defp restart_app(%Device{platform: :ios, serial: udid, dist_port: port}) do
+  defp restart_app(%Device{platform: :ios, serial: udid, dist_port: port, node_suffix: suffix}) do
     IO.write("  Restarting app on #{udid}...")
     IOS.terminate_app(udid, ios_bundle_id())
     :timer.sleep(500)
-    IOS.launch_app(udid, ios_bundle_id(), dist_port: port)
+    # node_suffix nil → IOS.launch_app omits SIMCTL_CHILD_MOB_NODE_SUFFIX
+    # → mob_beam.m auto-derives from SIMULATOR_UDID.
+    IOS.launch_app(udid, ios_bundle_id(), dist_port: port, node_suffix: suffix)
     IO.puts(" done")
   end
 
@@ -233,7 +277,9 @@ defmodule MobDev.Connector do
 
         {:error, reason} ->
           IO.puts("  #{color(:red)}✗#{color(:reset)}")
-          {ok, fail ++ [%{device | status: :error, error: reason}]}
+          diagnosis = connect_diagnosis(device)
+          error = if diagnosis, do: "#{reason} — #{diagnosis}", else: reason
+          {ok, fail ++ [%{device | status: :error, error: error}]}
       end
     end)
   end
@@ -255,6 +301,67 @@ defmodule MobDev.Connector do
   end
 
   defp node_candidates(%Device{node: node}), do: [node]
+
+  # Turn a black-box "timed out" into an actionable reason by inspecting the
+  # actual EPMD / forward / app state. Android only (the path users hit); other
+  # platforms fall through to nil and keep the bare reason.
+  @spec connect_diagnosis(Device.t()) :: String.t() | nil
+  defp connect_diagnosis(%Device{platform: :android, serial: serial, node: node, dist_port: port}) do
+    name = node |> Atom.to_string() |> String.split("@") |> hd()
+    registered_port = epmd_port_for(name)
+
+    cond do
+      not android_app_running?(serial) ->
+        "app not running on #{serial} (crashed, or Android App Standby killed its " <>
+          "network while backgrounded) — foreground it and retry"
+
+      registered_port == nil ->
+        "node #{name} never registered in EPMD — distribution didn't start on the " <>
+          "device. Check `adb -s #{serial} logcat` for the dist boot step"
+
+      registered_port != port ->
+        "node #{name} registered at port #{registered_port} but mob.connect uses " <>
+          "#{port} — re-run mob.connect to realign the forward"
+
+      not android_forwarded?(serial, port) ->
+        "no adb forward localhost:#{port} → #{serial}:#{port} — re-run mob.connect"
+
+      true ->
+        "registered + forwarded but Node.connect failed — likely a cookie mismatch " <>
+          "(both sides must use :mob_secret)"
+    end
+  end
+
+  defp connect_diagnosis(_device), do: nil
+
+  defp epmd_port_for(name) do
+    case System.cmd("epmd", ["-names"], stderr_to_stdout: true) do
+      {out, 0} ->
+        case Regex.run(~r/name #{Regex.escape(name)} at port (\d+)/, out) do
+          [_, p] -> String.to_integer(p)
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp android_forwarded?(serial, port) do
+    case System.cmd("adb", ["forward", "--list"], stderr_to_stdout: true) do
+      {out, 0} -> String.contains?(out, "#{serial} tcp:#{port} ")
+      _ -> false
+    end
+  end
+
+  defp android_app_running?(serial) do
+    case System.cmd("adb", ["-s", serial, "shell", "pidof", android_package()],
+           stderr_to_stdout: true
+         ) do
+      {out, 0} -> String.trim(out) != ""
+      _ -> false
+    end
+  end
 
   defp ios_sim_fallback_node(%Device{node: node}) do
     case Atom.to_string(node) |> String.split("@", parts: 2) do

@@ -19,13 +19,21 @@ defmodule MobDev.OtpDownloaderTest do
       assert path =~ "otp-android-arm32-"
     end
 
+    test "x86_64 returns a path containing the x86_64 artifact name" do
+      path = OtpDownloader.android_otp_dir("x86_64")
+      assert path =~ "otp-android-x86_64-"
+    end
+
     test "unknown ABI falls back to arm64 path" do
       assert OtpDownloader.android_otp_dir("x86") == OtpDownloader.android_otp_dir("arm64-v8a")
     end
 
-    test "arm64 and arm32 paths are distinct" do
+    test "arm64, arm32, and x86_64 paths are distinct" do
       refute OtpDownloader.android_otp_dir("arm64-v8a") ==
                OtpDownloader.android_otp_dir("armeabi-v7a")
+
+      refute OtpDownloader.android_otp_dir("arm64-v8a") ==
+               OtpDownloader.android_otp_dir("x86_64")
     end
 
     test "arm32 path ends inside the standard cache directory" do
@@ -64,6 +72,7 @@ defmodule MobDev.OtpDownloaderTest do
       add_crypto(tmp)
       assert OtpDownloader.valid_otp_dir?(tmp, "otp-android-7721ab74")
       assert OtpDownloader.valid_otp_dir?(tmp, "otp-android-arm32-7721ab74")
+      assert OtpDownloader.valid_otp_dir?(tmp, "otp-android-x86_64-7721ab74")
     end
 
     test "Android tarball: missing crypto.a → invalid", %{tmp: tmp} do
@@ -130,6 +139,57 @@ defmodule MobDev.OtpDownloaderTest do
 
     test "non-existent dir → invalid" do
       refute OtpDownloader.valid_otp_dir?("/nonexistent/path", "otp-ios-device-7721ab74")
+    end
+  end
+
+  # ── Elixir build/runtime version skew ───────────────────────────────────────
+  #
+  # Build Elixir ≠ device-runtime Elixir at the minor level is the Enum.__in__/2
+  # class of breakage (black screen at boot). We compare major.minor: rc/patch
+  # differences within a minor are beam-compatible and must NOT warn.
+
+  describe "elixir_skew/2" do
+    test "different minor is a skew" do
+      assert OtpDownloader.elixir_skew("1.20.0-rc.5", "1.19.5") ==
+               {:skew, "1.20.0-rc.5", "1.19.5"}
+    end
+
+    test "identical version is ok" do
+      assert OtpDownloader.elixir_skew("1.19.5", "1.19.5") == :ok
+    end
+
+    test "same minor, different patch is ok" do
+      assert OtpDownloader.elixir_skew("1.19.5", "1.19.6") == :ok
+    end
+
+    test "same minor, rc vs final is ok" do
+      assert OtpDownloader.elixir_skew("1.20.0-rc.5", "1.20.0") == :ok
+    end
+
+    test "nil bundled version (unreadable) does not warn" do
+      assert OtpDownloader.elixir_skew("1.20.0", nil) == :ok
+    end
+  end
+
+  describe "bundled_elixir_version/1" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "otp_elixir_vsn_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(Path.join(tmp, "lib/elixir/ebin"))
+      on_exit(fn -> File.rm_rf!(tmp) end)
+      {:ok, tmp: tmp}
+    end
+
+    test "reads the vsn from lib/elixir/ebin/elixir.app", %{tmp: tmp} do
+      File.write!(
+        Path.join(tmp, "lib/elixir/ebin/elixir.app"),
+        ~s|{application,elixir,[{description,"elixir"},{vsn,"1.19.5"},{modules,[]}]}.|
+      )
+
+      assert OtpDownloader.bundled_elixir_version(tmp) == "1.19.5"
+    end
+
+    test "missing elixir.app returns nil", %{tmp: tmp} do
+      assert OtpDownloader.bundled_elixir_version(tmp) == nil
     end
   end
 end

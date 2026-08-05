@@ -11,24 +11,36 @@ defmodule MobDev.ReleaseAndroid do
        - exqlite BEAMs → `lib/exqlite-{vsn}/ebin/` (OTP lib structure needed
          for `:code.lib_dir(:exqlite)` to resolve correctly at runtime)
     3. Run `MobDev.OtpAssetBundle.build/2` — strips unused OTP libs and
-       optional BEAM chunks, then zips the tree to `assets/otp.zip`.
+       optional BEAM chunks, then zips the tree to
+       `src/release/assets/otp.zip`.
     4. Run `./gradlew bundleRelease` — signs the AAB using the keystore
        configured in `android/keystore.properties`.
 
   `MobBridge.extractOtpIfNeeded()` (Kotlin) extracts `otp.zip` into
   `<filesDir>/otp/` on first launch. Without this zip the app crashes
   immediately — the BEAM has no runtime or application BEAMs to load.
+
+  The zip is written to the `release`-variant asset source set, not the
+  shared `main` one — Gradle only merges `src/release/assets/` into release
+  builds, so a leftover zip from a prior release build can never leak into
+  (and silently poison) a subsequent debug build. See
+  `decisions/2026-07-24-release-otp-zip-variant-scoped-assets.md`.
   """
 
-  @app_assets "android/app/src/main/assets"
+  @app_assets "android/app/src/release/assets"
+
+  @doc false
+  @spec otp_zip_path() :: String.t()
+  def otp_zip_path, do: Path.expand(Path.join(@app_assets, "otp.zip"))
 
   @doc """
   Runs the full Android release pipeline and returns `{:ok, aab_path}` or
   `{:error, reason}`.
   """
   @spec build_aab(keyword()) :: {:ok, Path.t()} | {:error, String.t()}
-  def build_aab(_opts \\ []) do
+  def build_aab(opts \\ []) do
     app_name = Mix.Project.config()[:app] |> to_string()
+    slim = Keyword.get(opts, :slim, true)
 
     with :ok <- check_android_project(),
          log("Ensuring Android OTP runtime..."),
@@ -36,7 +48,7 @@ defmodule MobDev.ReleaseAndroid do
          log("Staging OTP tree + app BEAMs..."),
          {:ok, staging} <- stage_otp_tree(otp_arm64, app_name),
          log("Building otp.zip (stripping unused OTP libs)..."),
-         {:ok, info} <- build_zip(staging),
+         {:ok, info} <- build_zip(staging, slim),
          _ = File.rm_rf!(staging),
          log(
            "  #{info.zipped_files} files, " <>
@@ -61,13 +73,36 @@ defmodule MobDev.ReleaseAndroid do
         add_app_beams!(staging, app_name)
         add_app_priv!(staging, app_name)
         add_exqlite!(staging)
-        patch_crypto_deps!(staging)
-        add_crypto_stub!(staging, app_name)
+
+        # Only stub :crypto when the OTP runtime genuinely lacks the
+        # OpenSSL NIF. When crypto.a is present (the Android CMakeLists.txt
+        # statically links crypto.a + libcrypto.a and registers
+        # crypto_nif_init in the driver table), the real :crypto works —
+        # stubbing it replaces crypto.beam with one whose supports/1
+        # returns [], making :ssl.versions/0 raise and breaking every
+        # HTTPS request (TLS handshake never starts).
+        if real_crypto_available?(otp_dir) do
+          log("  real crypto.a present — keeping OpenSSL crypto (no stub)")
+        else
+          patch_crypto_deps!(staging)
+          add_crypto_stub!(staging, app_name)
+        end
+
         {:ok, staging}
 
       {out, _} ->
         {:error, "Failed to copy OTP tree: #{out}"}
     end
+  end
+
+  # True when the OTP runtime ships the real OpenSSL crypto NIF static
+  # archive (crypto.a). The Android native build links it into the app
+  # .so, so the BEAM has working :crypto and must not get the stub.
+  # Public for testing.
+  @doc false
+  @spec real_crypto_available?(Path.t()) :: boolean()
+  def real_crypto_available?(otp_dir) do
+    Path.wildcard(Path.join(otp_dir, "erts-*/lib/crypto.a")) != []
   end
 
   # Flatten all runtime BEAMs (app + deps) into {staging}/{app_name}/.
@@ -205,10 +240,10 @@ defmodule MobDev.ReleaseAndroid do
 
   # ── otp.zip ──────────────────────────────────────────────────────────────────
 
-  defp build_zip(staging) do
-    zip_path = Path.expand(Path.join(@app_assets, "otp.zip"))
+  defp build_zip(staging, slim) do
+    zip_path = otp_zip_path()
     File.mkdir_p!(Path.dirname(zip_path))
-    MobDev.OtpAssetBundle.build(staging, zip_path)
+    MobDev.OtpAssetBundle.build(staging, zip_path, slim: slim)
   end
 
   # ── Gradle ───────────────────────────────────────────────────────────────────

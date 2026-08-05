@@ -10,6 +10,469 @@ defmodule MobDev.NativeBuildTest do
 
   alias MobDev.NativeBuild
 
+  describe "build_outcome/1" do
+    test "an empty native target set fails closed" do
+      assert NativeBuild.build_outcome([]) == %{
+               ok?: false,
+               android_device_disposition: :not_attempted,
+               android_serials: [],
+               android_deploy_lock: nil,
+               android_payload_plan: nil
+             }
+    end
+
+    test "one successful platform remains a valid partial multi-platform outcome" do
+      assert NativeBuild.build_outcome([{:ok, "iOS"}]) == %{
+               ok?: true,
+               android_device_disposition: :not_attempted,
+               android_serials: [],
+               android_deploy_lock: nil,
+               android_payload_plan: nil
+             }
+    end
+
+    test "any attempted native platform failure fails the aggregate outcome" do
+      assert NativeBuild.build_outcome([
+               {:ok, "iOS"},
+               {:error, "Android", "target unavailable"}
+             ]) == %{
+               ok?: false,
+               android_device_disposition: :failed,
+               android_serials: [],
+               android_deploy_lock: nil,
+               android_payload_plan: nil
+             }
+    end
+
+    test "an artifact-only Android success exposes no targets, lease, or payload plan" do
+      assert NativeBuild.build_outcome([
+               {:ok, "Android", %{serials: [], deploy_lock: nil, payload_plan: nil}}
+             ]) == %{
+               ok?: true,
+               android_device_disposition: :artifact_only,
+               android_serials: [],
+               android_deploy_lock: nil,
+               android_payload_plan: nil
+             }
+    end
+
+    test "an aggregate failure hides the Android payload plan but retains the lease" do
+      lease = %{state: :native_ready}
+      plan = %{version: 1}
+
+      assert NativeBuild.build_outcome([
+               {:ok, "Android", %{serials: ["serial-a"], deploy_lock: lease, payload_plan: plan}},
+               {:error, "iOS", "build failed"}
+             ]) == %{
+               ok?: false,
+               android_device_disposition: :failed,
+               android_serials: ["serial-a"],
+               android_deploy_lock: lease,
+               android_payload_plan: nil
+             }
+    end
+
+    test "a later-platform failure and cleanup failure still return the exact Android lease" do
+      lease = %{
+        bundle_id: "com.example.casein",
+        owner: "ownerproof000001",
+        serials: ["serial-a"],
+        target_digest: String.duplicate("a", 64),
+        phase: :native_ready,
+        state: :held_success
+      }
+
+      plan = %{attempt_id: "planbeam00000001"}
+
+      results = [
+        {:ok, "Android", %{serials: ["serial-a"], deploy_lock: lease, payload_plan: plan}},
+        {:error, "iOS", "injected later-platform failure"}
+      ]
+
+      cleanup = fn ^plan ->
+        send(self(), :aggregate_cleanup_attempted)
+        {:error, :injected_cleanup_failure}
+      end
+
+      assert NativeBuild.build_outcome(results, android_preinstall_cleanup: cleanup) == %{
+               ok?: false,
+               android_device_disposition: :failed,
+               android_serials: ["serial-a"],
+               android_deploy_lock: lease,
+               android_payload_plan: nil
+             }
+
+      assert_received :aggregate_cleanup_attempted
+    end
+
+    test "reports retained and ambiguous Android authority with a bounded disposition" do
+      held = native_ready_lease(["serial-a"])
+      retained = %{held | state: :retained_ambiguous}
+
+      assert %{
+               android_device_disposition: :held,
+               android_deploy_lock: ^held
+             } =
+               NativeBuild.build_outcome([
+                 {:ok, "Android",
+                  %{
+                    serials: ["serial-a"],
+                    deploy_lock: held,
+                    payload_plan: %{version: 1}
+                  }}
+               ])
+
+      assert %{
+               android_device_disposition: :retained,
+               android_deploy_lock: ^retained
+             } =
+               NativeBuild.build_outcome([
+                 {:error, "Android", "typed failure", retained}
+               ])
+
+      assert %{
+               android_device_disposition: :retained,
+               android_deploy_lock: ^held
+             } =
+               NativeBuild.build_outcome([
+                 {:ok, "Android", %{serials: ["serial-a"], deploy_lock: held}},
+                 {:error, "Android", "duplicate result"}
+               ])
+    end
+
+    test "reports an explicit partial update with the exact retained target set" do
+      retained =
+        ["serial-a", "serial-b"]
+        |> native_ready_lease()
+        |> Map.merge(%{phase: :acquired, state: :retained_ambiguous})
+
+      assert NativeBuild.build_outcome([
+               {:error, "Android", "runtime delivery failed", retained, :partial_update}
+             ]) == %{
+               ok?: false,
+               android_device_disposition: :partial_update,
+               android_serials: ["serial-a", "serial-b"],
+               android_deploy_lock: retained,
+               android_payload_plan: nil
+             }
+    end
+  end
+
+  describe "ios_phase_decision/3" do
+    test "defers iOS for one exact held Android device phase" do
+      serials = ["serial-a", "serial-b"]
+      lock = native_ready_lease(serials)
+
+      results = [
+        {:ok, "Android", %{serials: serials, deploy_lock: lock, payload_plan: %{version: 1}}}
+      ]
+
+      assert NativeBuild.ios_phase_decision(results, [:android, :ios], true) == :defer
+    end
+
+    test "suppresses iOS after an Android device-phase error or invalid held result" do
+      lock = native_ready_lease(["serial-a"])
+
+      for results <- [
+            [{:error, "Android", "update failed"}],
+            [{:error, "Android", "update ambiguous", %{lock | state: :retained_ambiguous}}],
+            [{:ok, "Android", %{serials: ["serial-b"], deploy_lock: lock}}],
+            [
+              {:ok, "Android", %{serials: ["serial-a"], deploy_lock: lock}},
+              {:error, "Android", "duplicate result"}
+            ]
+          ] do
+        assert NativeBuild.ios_phase_decision(results, [:android, :ios], true) == :suppress
+      end
+    end
+
+    test "preserves iOS for artifact-only work and when Android had no device-phase result" do
+      android_error = [{:error, "Android", "artifact build failed"}]
+
+      assert NativeBuild.ios_phase_decision(android_error, [:android, :ios], false) == :run
+      assert NativeBuild.ios_phase_decision([], [:android, :ios], true) == :run
+      assert NativeBuild.ios_phase_decision([{:ok, "iOS"}], [:android, :ios], true) == :run
+      assert NativeBuild.ios_phase_decision([], [:android], true) == :skip
+    end
+  end
+
+  describe "build_zig_supports_abi?/2" do
+    test "true when the build.zig declares the ABI as a quoted string literal" do
+      src = ~s|
+        if (std.mem.eql(u8, abi, "arm64-v8a")) return "aarch64-linux-android";
+        if (std.mem.eql(u8, abi, "x86_64")) return "x86_64-linux-android";
+      |
+
+      assert NativeBuild.build_zig_supports_abi?(src, "arm64-v8a")
+      assert NativeBuild.build_zig_supports_abi?(src, "x86_64")
+    end
+
+    test "false when the ABI is absent (e.g. a pre-x86_64 mob_new < 0.4.5 build.zig)" do
+      src = ~s|
+        if (std.mem.eql(u8, abi, "arm64-v8a")) return "aarch64-linux-android";
+        if (std.mem.eql(u8, abi, "armeabi-v7a")) return "arm-linux-androideabi";
+        // ERROR: unsupported -Dabi (expected arm64-v8a or armeabi-v7a)
+      |
+
+      assert NativeBuild.build_zig_supports_abi?(src, "armeabi-v7a")
+      refute NativeBuild.build_zig_supports_abi?(src, "x86_64")
+    end
+  end
+
+  describe "inject_page_size_flag/1" do
+    test "injects the 16 KB flag into a stale build.zig's -shared link" do
+      src = ~s|    const run = b.addSystemCommand(&.{ ndk_clang, target_arg, "-shared" });|
+      assert {:patched, out} = NativeBuild.inject_page_size_flag(src)
+      assert out =~ ~s|"-shared", "-Wl,-z,max-page-size=16384" })|
+      assert out =~ "max-page-size=16384"
+    end
+
+    test "patches every -shared link (app .so + sqlite .so)" do
+      src = ~s|
+        const run = b.addSystemCommand(&.{ ndk_clang, target_arg, "-shared" });
+        const run = b.addSystemCommand(&.{ ndk_clang, target_arg, "-shared" });
+      |
+
+      assert {:patched, out} = NativeBuild.inject_page_size_flag(src)
+      assert length(String.split(out, "max-page-size=16384")) == 3
+    end
+
+    test "idempotent — already-aligned build.zig is left unchanged" do
+      # mirrors how the mob_new template / a hand-fixed app (e.g. Io) carries it
+      src = ~s|
+        const run = b.addSystemCommand(&.{ ndk_clang, target_arg, "-shared" });
+        run.addArg("-Wl,-z,max-page-size=16384");
+      |
+
+      assert {:already, ^src} = NativeBuild.inject_page_size_flag(src)
+    end
+
+    test "no_match when the -shared link line is unrecognized" do
+      src = ~s|    // a build.zig that does its linking some other way|
+      assert {:no_match, ^src} = NativeBuild.inject_page_size_flag(src)
+    end
+  end
+
+  describe "__driver_tab_formats__/1 + regen_driver_tab!/0" do
+    test "detects the formats whose generated files exist" do
+      zig_paths = Mix.Tasks.Mob.RegenDriverTab.target_paths(:zig)
+      c_paths = Mix.Tasks.Mob.RegenDriverTab.target_paths(:c)
+
+      assert NativeBuild.__driver_tab_formats__(fn _ -> false end) == []
+      assert NativeBuild.__driver_tab_formats__(&(&1 == zig_paths.android)) == [:zig]
+      assert NativeBuild.__driver_tab_formats__(&(&1 == c_paths.ios)) == [:c]
+      assert NativeBuild.__driver_tab_formats__(fn _ -> true end) == [:zig, :c]
+    end
+
+    test "rewrites a stale on-disk driver_tab (the :nif_not_loaded footgun)" do
+      dir =
+        Path.join(System.tmp_dir!(), "mob_driver_tab_regen_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(Path.join(dir, "priv/generated"))
+      stale_path = Path.join(dir, "priv/generated/driver_tab_android.zig")
+      File.write!(stale_path, "// stale — generated before a plugin was added\n")
+
+      cwd = File.cwd!()
+      File.cd!(dir)
+
+      try do
+        assert :ok = NativeBuild.regen_driver_tab!()
+        regenerated = File.read!(stale_path)
+        refute regenerated =~ "stale"
+        # The zig sibling is regenerated alongside; the c format stays absent.
+        assert File.exists?(Path.join(dir, "priv/generated/driver_tab_ios.zig"))
+        refute File.exists?(Path.join(dir, "priv/generated/driver_tab_ios.c"))
+      after
+        File.cd!(cwd)
+        File.rm_rf!(dir)
+      end
+    end
+
+    test "leaves a project with no generated driver_tab untouched" do
+      dir =
+        Path.join(System.tmp_dir!(), "mob_driver_tab_none_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      cwd = File.cwd!()
+      File.cd!(dir)
+
+      try do
+        assert :ok = NativeBuild.regen_driver_tab!()
+        assert File.ls!(dir) == []
+      after
+        File.cd!(cwd)
+        File.rm_rf!(dir)
+      end
+    end
+  end
+
+  describe "__merge_android_manifest_components__/2" do
+    @manifest """
+    <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+        <application android:label="X">
+            <activity android:name=".MainActivity"/>
+        </application>
+    </manifest>
+    """
+
+    test "splices a component in just before </application>" do
+      out =
+        NativeBuild.__merge_android_manifest_components__(@manifest, [
+          ~s(<service android:name="io.mob.nfc.MobNfcApduService" android:exported="true"/>)
+        ])
+
+      assert out =~ ~s(<service android:name="io.mob.nfc.MobNfcApduService")
+      # inserted inside <application> (before its close, after the activity)
+      assert out =~ ~r/MainActivity.*MobNfcApduService.*<\/application>/s
+    end
+
+    test "is idempotent on the component's android:name" do
+      snippet = ~s(<service android:name="io.mob.nfc.MobNfcApduService"/>)
+      once = NativeBuild.__merge_android_manifest_components__(@manifest, [snippet])
+      twice = NativeBuild.__merge_android_manifest_components__(once, [snippet])
+      assert once == twice
+      assert length(String.split(once, "MobNfcApduService")) == 2
+    end
+
+    test "removing the plugin (empty set) strips the previously-injected region" do
+      snippet = ~s(<service android:name="io.mob.nfc.MobNfcApduService"/>)
+      with_svc = NativeBuild.__merge_android_manifest_components__(@manifest, [snippet])
+      assert with_svc =~ "MobNfcApduService"
+      # plugin removed → next build contributes no components → region gone
+      cleaned = NativeBuild.__merge_android_manifest_components__(with_svc, [])
+      refute cleaned =~ "MobNfcApduService"
+      refute cleaned =~ "mob:plugin-components"
+      assert cleaned == @manifest
+    end
+
+    test "swapping which plugin is active replaces the component (old one gone)" do
+      a =
+        NativeBuild.__merge_android_manifest_components__(@manifest, [
+          ~s(<service android:name="io.a.Svc"/>)
+        ])
+
+      b =
+        NativeBuild.__merge_android_manifest_components__(a, [
+          ~s(<service android:name="io.b.Svc"/>)
+        ])
+
+      assert b =~ "io.b.Svc"
+      refute b =~ "io.a.Svc"
+    end
+
+    test "no snippets → manifest unchanged" do
+      assert NativeBuild.__merge_android_manifest_components__(@manifest, []) == @manifest
+    end
+
+    test "no </application> → returns manifest untouched rather than corrupting it" do
+      weird = "<manifest></manifest>"
+      assert NativeBuild.__merge_android_manifest_components__(weird, ["<service/>"]) == weird
+    end
+
+    test "preserves nested indentation, shifted into <application>" do
+      snippet = "<service android:name=\"io.x.S\">\n  <intent-filter/>\n</service>"
+      out = NativeBuild.__merge_android_manifest_components__(@manifest, [snippet])
+      assert out =~ "        <service android:name=\"io.x.S\">"
+      assert out =~ "          <intent-filter/>"
+    end
+  end
+
+  describe "__res_target__/2 (plugin res path containment)" do
+    @root "android/app/src/main"
+
+    test "a normal res destination resolves to a copy target under res/" do
+      assert {:ok, "android/app/src/main/res/xml/svc.xml"} =
+               NativeBuild.__res_target__(@root, "res/xml/svc.xml")
+    end
+
+    test "a .. traversal that escapes res/ is rejected" do
+      assert {:error, :escapes_res_dir} =
+               NativeBuild.__res_target__(@root, "res/../../../build.gradle")
+    end
+
+    test "a deeper traversal to an arbitrary host path is rejected" do
+      assert {:error, :escapes_res_dir} =
+               NativeBuild.__res_target__(@root, "res/../../../../../../etc/hosts")
+    end
+
+    test "the res dir itself is allowed but a sibling of res/ is not" do
+      assert {:ok, _} = NativeBuild.__res_target__(@root, "res")
+      assert {:error, :escapes_res_dir} = NativeBuild.__res_target__(@root, "res/../resx/x")
+    end
+  end
+
+  describe "__notify_hub_kotlin__/0" do
+    test "generated hub is the stable io.mob.plugin seam with the three members" do
+      src = NativeBuild.__notify_hub_kotlin__()
+      assert src =~ "package io.mob.plugin"
+      assert src =~ "object MobNotifyHub"
+      assert src =~ ~s(const val CHANNEL_ID = "mob_notifications")
+      assert src =~ "var notifyPid: Long = 0"
+      assert src =~ "var pendingToken: String? = null"
+    end
+  end
+
+  describe "__host_requirements_warning__/1" do
+    test "no obligations → no warning" do
+      assert NativeBuild.__host_requirements_warning__([]) == nil
+    end
+
+    test "renders one line per obligation, tagged with the plugin" do
+      msg =
+        NativeBuild.__host_requirements_warning__([
+          %{plugin: :mob_screencast, requirement: "add the mediaProjection <service>"},
+          %{plugin: :mob_camera, requirement: "declare a FileProvider"}
+        ])
+
+      assert msg =~ "manual steps the build can NOT do for you"
+      assert msg =~ "[mob_screencast] add the mediaProjection <service>"
+      assert msg =~ "[mob_camera] declare a FileProvider"
+    end
+  end
+
+  describe "__elixir_lib_decision__/3 (which Elixir stdlib to bundle)" do
+    test "missing configured path → detect from running BEAM" do
+      assert NativeBuild.__elixir_lib_decision__(false, nil, "1.20.0") ==
+               {:use_detected, :missing}
+    end
+
+    test "matching version → honor the configured path" do
+      assert NativeBuild.__elixir_lib_decision__(true, "1.20.0", "1.20.0") ==
+               {:use_configured}
+    end
+
+    test "version skew → fall back to the toolchain's stdlib" do
+      # The exact bug this guards: mob.exs pinned 1.20.0-rc.5 while the toolchain
+      # is 1.20.0 final. rc.5's elixir_quote lacks validate_quote/1, so bundling
+      # it crashes on-device Ecto-migration compilation.
+      assert NativeBuild.__elixir_lib_decision__(true, "1.20.0-rc.5", "1.20.0") ==
+               {:use_detected, :version_skew}
+    end
+
+    test "present but unreadable version → honor config (can't prove it wrong)" do
+      assert NativeBuild.__elixir_lib_decision__(true, nil, "1.20.0") ==
+               {:use_configured}
+    end
+  end
+
+  describe "__elixir_lib_skew_warning__/4" do
+    test "names both versions, the failure mode, and the fallback" do
+      msg =
+        NativeBuild.__elixir_lib_skew_warning__(
+          "/x/1.20.0-rc.5-otp-29/lib",
+          "1.20.0-rc.5",
+          "1.20.0",
+          "/y/1.20.0-otp-29/lib"
+        )
+
+      assert msg =~ "1.20.0-rc.5"
+      assert msg =~ "1.20.0"
+      assert msg =~ "validate_quote/1"
+      assert msg =~ "/y/1.20.0-otp-29/lib"
+      assert msg =~ "mob.exs"
+    end
+  end
+
   describe "otp_dir_for_abi/3" do
     test "armeabi-v7a returns the arm32 path" do
       assert NativeBuild.otp_dir_for_abi("armeabi-v7a", "/otp/arm64", "/otp/arm32") ==
@@ -28,6 +491,16 @@ defmodule MobDev.NativeBuildTest do
 
     test "empty ABI string falls back to arm64" do
       assert NativeBuild.otp_dir_for_abi("", "/otp/arm64", "/otp/arm32") == "/otp/arm64"
+    end
+
+    test "x86_64 returns the x86_64 path when provided" do
+      assert NativeBuild.otp_dir_for_abi("x86_64", "/otp/arm64", "/otp/arm32", "/otp/x86_64") ==
+               "/otp/x86_64"
+    end
+
+    test "unknown ABI still falls back to arm64 when x86_64 path is provided" do
+      assert NativeBuild.otp_dir_for_abi("x86", "/otp/arm64", "/otp/arm32", "/otp/x86_64") ==
+               "/otp/arm64"
     end
   end
 
@@ -62,6 +535,373 @@ defmodule MobDev.NativeBuildTest do
 
     test "non-matching id returns empty list" do
       assert NativeBuild.filter_serials(@serials, "NOPE") == []
+    end
+  end
+
+  describe "__project_swift_sources_arg__/1" do
+    test "joins extra iOS Swift sources as absolute comma-separated paths" do
+      cwd = File.cwd!()
+
+      assert NativeBuild.__project_swift_sources_arg__(
+               project_swift_sources: ["ios/Bridge.swift", "../shared/Peer.swift"]
+             ) ==
+               Enum.join(
+                 [
+                   Path.expand("ios/Bridge.swift", cwd),
+                   Path.expand("../shared/Peer.swift", cwd)
+                 ],
+                 ","
+               )
+    end
+
+    test "defaults to an empty option value" do
+      assert NativeBuild.__project_swift_sources_arg__([]) == ""
+      assert NativeBuild.__project_swift_sources_arg__(project_swift_sources: nil) == ""
+    end
+
+    test "rejects comma-containing source entries" do
+      assert_raise Mix.Error, ~r/must not contain commas/, fn ->
+        NativeBuild.__project_swift_sources_arg__(project_swift_sources: ["a.swift,b.swift"])
+      end
+    end
+  end
+
+  describe "plugin Kotlin bootstrap helpers" do
+    test "__parse_kotlin_package__ extracts the FQ package" do
+      assert NativeBuild.__parse_kotlin_package__(
+               "package io.mob.bluetooth\n\nobject MobBluetoothBridge {}"
+             ) == "io.mob.bluetooth"
+    end
+
+    test "__parse_kotlin_package__ tolerates leading whitespace / comments before it" do
+      src = "// header\n  package io.mob.bluetooth\n"
+      assert NativeBuild.__parse_kotlin_package__(src) == "io.mob.bluetooth"
+    end
+
+    test "__parse_kotlin_package__ returns nil when there's no package line" do
+      assert NativeBuild.__parse_kotlin_package__("object Foo {}") == nil
+    end
+
+    test "__bridge_kt_dest__ maps package + basename under the java root" do
+      assert NativeBuild.__bridge_kt_dest__(
+               "android/app/src/main/java",
+               "io.mob.bluetooth",
+               "MobBluetoothBridge.kt"
+             ) == "android/app/src/main/java/io/mob/bluetooth/MobBluetoothBridge.kt"
+    end
+
+    test "__bootstrap_kotlin__ emits register() + activity handoff per bridge class" do
+      src = NativeBuild.__bootstrap_kotlin__(["io.mob.bluetooth.MobBluetoothBridge"])
+      assert src =~ "package io.mob.plugin"
+      assert src =~ "import android.app.Activity"
+      assert src =~ "object MobPluginBootstrap"
+      assert src =~ "fun registerAll(activity: Activity)"
+      assert src =~ "io.mob.bluetooth.MobBluetoothBridge.register()"
+      assert src =~ "handOff(io.mob.bluetooth.MobBluetoothBridge, activity)"
+      assert src =~ "collectPermissionProvider(io.mob.bluetooth.MobBluetoothBridge)"
+      # The cast lives in the Any-typed helper, never inline against a final object.
+      assert src =~ "private fun handOff(bridge: Any, activity: Activity)"
+      assert src =~ "(bridge as? MobActivityAware)?.setActivity(activity)"
+      assert src =~ "private fun collectPermissionProvider(bridge: Any)"
+      assert src =~ "(bridge as? MobPermissionProvider)?.let {"
+      refute src =~ "MobBluetoothBridge as? MobActivityAware"
+    end
+
+    test "__bootstrap_kotlin__ always exposes permissionsFor for core to consult" do
+      # Present with bridges...
+      with_bridge = NativeBuild.__bootstrap_kotlin__(["io.mob.location.MobLocationBridge"])
+
+      assert with_bridge =~
+               "private val permissionProviders = mutableListOf<MobPermissionProvider>()"
+
+      assert with_bridge =~ "fun permissionsFor(cap: String): Array<String>?"
+
+      # ...and without (so MobBridge can reference it unconditionally).
+      empty = NativeBuild.__bootstrap_kotlin__([])
+      assert empty =~ "fun permissionsFor(cap: String): Array<String>?"
+      assert empty =~ "private val permissionProviders = mutableListOf<MobPermissionProvider>()"
+    end
+
+    test "__bootstrap_kotlin__ hands the activity to every bridge uniformly" do
+      src =
+        NativeBuild.__bootstrap_kotlin__([
+          "io.mob.bluetooth.MobBluetoothBridge",
+          "io.mob.zigextras.MobZigExtrasBridge"
+        ])
+
+      # One register() + one handOff() per class, no per-plugin branching, and
+      # exactly one shared helper holding the single cast.
+      assert length(Regex.scan(~r/\.register\(\)/, src)) == 2
+      assert length(Regex.scan(~r/handOff\([\w.]+, activity\)/, src)) == 2
+      assert length(Regex.scan(~r/collectPermissionProvider\([\w.]+\)/, src)) == 2
+      assert length(Regex.scan(~r/as\? MobActivityAware/, src)) == 1
+      assert length(Regex.scan(~r/as\? MobPermissionProvider/, src)) == 1
+    end
+
+    test "__bootstrap_kotlin__ emits an empty registerAll body and no register helpers when no bridges" do
+      src = NativeBuild.__bootstrap_kotlin__([])
+      assert src =~ "fun registerAll(activity: Activity) {}"
+      refute src =~ ".register()"
+      refute src =~ "handOff"
+      refute src =~ "collectPermissionProvider"
+    end
+
+    test "__activity_aware_kotlin__ emits the stable MobActivityAware contract" do
+      src = NativeBuild.__activity_aware_kotlin__()
+      assert src =~ "package io.mob.plugin"
+      assert src =~ "import android.app.Activity"
+      assert src =~ "interface MobActivityAware {"
+      assert src =~ "fun setActivity(activity: Activity)"
+    end
+
+    test "__permission_provider_kotlin__ emits the stable MobPermissionProvider contract" do
+      src = NativeBuild.__permission_provider_kotlin__()
+      assert src =~ "package io.mob.plugin"
+      assert src =~ "interface MobPermissionProvider {"
+      assert src =~ "fun permissionsFor(cap: String): Array<String>?"
+    end
+  end
+
+  describe "__merge_android_permissions__/2" do
+    @manifest_with_perms """
+    <?xml version="1.0" encoding="utf-8"?>
+    <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.app">
+        <uses-permission android:name="android.permission.INTERNET" />
+        <uses-permission android:name="android.permission.CAMERA" />
+        <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+        <application
+            android:label="App">
+        </application>
+    </manifest>
+    """
+
+    @manifest_without_perms """
+    <?xml version="1.0" encoding="utf-8"?>
+    <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+        package="com.example.app">
+        <application
+            android:label="App">
+        </application>
+    </manifest>
+    """
+
+    test "is a no-op when permission list is empty" do
+      assert NativeBuild.__merge_android_permissions__(@manifest_with_perms, []) ==
+               @manifest_with_perms
+    end
+
+    test "removing the plugin strips its managed permission region, keeping host perms" do
+      added =
+        NativeBuild.__merge_android_permissions__(@manifest_with_perms, [
+          "android.permission.BLUETOOTH_CONNECT"
+        ])
+
+      assert added =~ "BLUETOOTH_CONNECT"
+      cleaned = NativeBuild.__merge_android_permissions__(added, [])
+      refute cleaned =~ "BLUETOOTH_CONNECT"
+      refute cleaned =~ "mob:plugin-permissions"
+      # host-declared permissions are untouched
+      assert cleaned =~ "android.permission.INTERNET"
+      assert cleaned == @manifest_with_perms
+    end
+
+    test "a host-declared permission is not duplicated into the managed region" do
+      out =
+        NativeBuild.__merge_android_permissions__(@manifest_with_perms, [
+          "android.permission.CAMERA"
+        ])
+
+      # CAMERA already declared by hand → not added again
+      assert length(String.split(out, ~s(android:name="android.permission.CAMERA"))) == 2
+    end
+
+    test "forward-only: an existing UNFENCED entry is treated as host-authored" do
+      # Simulates an app an older mob_dev already patched (CAMERA appended
+      # unfenced). It's indistinguishable from a hand-added permission, so it is
+      # neither re-added to the fence nor removed when the plugin goes away.
+      with_plugin =
+        NativeBuild.__merge_android_permissions__(@manifest_with_perms, [
+          "android.permission.CAMERA"
+        ])
+
+      assert with_plugin == @manifest_with_perms
+      refute with_plugin =~ "mob:plugin-permissions"
+
+      # plugin removed → the pre-existing unfenced CAMERA line survives
+      cleaned = NativeBuild.__merge_android_permissions__(with_plugin, [])
+      assert cleaned =~ "android.permission.CAMERA"
+    end
+
+    test "is a no-op when every permission is already declared" do
+      perms = ["android.permission.CAMERA", "android.permission.INTERNET"]
+
+      assert NativeBuild.__merge_android_permissions__(@manifest_with_perms, perms) ==
+               @manifest_with_perms
+    end
+
+    test "adds only missing permissions, dedup against existing" do
+      # Project has INTERNET + CAMERA + RECORD_AUDIO (3 lines). Plugin set
+      # contributes 4 of which 1 (CAMERA) is already there → expect 3 + 3 = 6
+      # uses-permission tags in the result, no duplicates.
+      perms = [
+        "android.permission.CAMERA",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.POST_NOTIFICATIONS"
+      ]
+
+      result = NativeBuild.__merge_android_permissions__(@manifest_with_perms, perms)
+
+      tags = Regex.scan(~r/<uses-permission android:name="([^"]+)"/, result)
+      names = Enum.map(tags, fn [_, name] -> name end)
+
+      assert length(names) == 6
+      assert Enum.uniq(names) == names
+
+      assert "android.permission.BLUETOOTH_CONNECT" in names
+      assert "android.permission.BLUETOOTH_SCAN" in names
+      assert "android.permission.POST_NOTIFICATIONS" in names
+    end
+
+    test "the managed region sits after host permissions (before <application)" do
+      perms = ["android.permission.BLUETOOTH_CONNECT"]
+      result = NativeBuild.__merge_android_permissions__(@manifest_with_perms, perms)
+
+      # Host perms stay first; the fenced plugin perm follows, still before
+      # <application: INTERNET, CAMERA, RECORD_AUDIO, then BLUETOOTH_CONNECT.
+      offsets =
+        for tag <- [
+              "android.permission.INTERNET",
+              "android.permission.CAMERA",
+              "android.permission.RECORD_AUDIO",
+              "android.permission.BLUETOOTH_CONNECT"
+            ],
+            do: :binary.match(result, tag) |> elem(0)
+
+      assert offsets == Enum.sort(offsets)
+    end
+
+    test "inserts before <application when manifest has no existing permissions" do
+      perms = ["android.permission.CAMERA"]
+      result = NativeBuild.__merge_android_permissions__(@manifest_without_perms, perms)
+
+      assert String.contains?(
+               result,
+               ~s(<uses-permission android:name="android.permission.CAMERA" />)
+             )
+
+      perm_idx = :binary.match(result, "android.permission.CAMERA") |> elem(0)
+      app_idx = :binary.match(result, "<application") |> elem(0)
+      assert perm_idx < app_idx
+    end
+
+    test "is idempotent — running twice gives the same result" do
+      perms = ["android.permission.BLUETOOTH_CONNECT", "android.permission.BLUETOOTH_SCAN"]
+      once = NativeBuild.__merge_android_permissions__(@manifest_with_perms, perms)
+      twice = NativeBuild.__merge_android_permissions__(once, perms)
+      assert once == twice
+    end
+  end
+
+  describe "__merge_gradle_deps__/2" do
+    @gradle """
+    plugins {
+        id 'com.android.application'
+    }
+
+    android {
+        namespace 'com.example.app'
+    }
+
+    dependencies {
+        implementation 'androidx.appcompat:appcompat:1.6.1'
+        implementation 'androidx.camera:camera-camera2:1.3.4'
+    }
+    """
+
+    test "is a no-op when dep list is empty" do
+      assert NativeBuild.__merge_gradle_deps__(@gradle, []) == @gradle
+    end
+
+    test "removing the plugin strips its managed dep region, keeping host deps" do
+      added = NativeBuild.__merge_gradle_deps__(@gradle, ["com.example:foo:1.0.0"])
+      assert added =~ "com.example:foo:1.0.0"
+      # region lives inside the dependencies block
+      assert added =~ ~r/dependencies\s*\{.*mob:plugin-deps.*\}/s
+      cleaned = NativeBuild.__merge_gradle_deps__(added, [])
+      refute cleaned =~ "com.example:foo:1.0.0"
+      refute cleaned =~ "mob:plugin-deps"
+      assert cleaned =~ "androidx.appcompat:appcompat:1.6.1"
+      assert cleaned == @gradle
+    end
+
+    test "is a no-op when every dep is already present" do
+      deps = ["androidx.appcompat:appcompat:1.6.1", "androidx.camera:camera-camera2:1.3.4"]
+      assert NativeBuild.__merge_gradle_deps__(@gradle, deps) == @gradle
+    end
+
+    test "adds only missing deps inside the dependencies block" do
+      deps = [
+        "com.github.PhilJay:MPAndroidChart:v3.1.0",
+        "androidx.appcompat:appcompat:1.6.1",
+        "com.example:foo:1.0.0"
+      ]
+
+      result = NativeBuild.__merge_gradle_deps__(@gradle, deps)
+
+      assert String.contains?(
+               result,
+               ~s(implementation "com.github.PhilJay:MPAndroidChart:v3.1.0")
+             )
+
+      assert String.contains?(result, ~s(implementation "com.example:foo:1.0.0"))
+
+      # Existing appcompat dep stays its original form — no duplicate.
+      appcompat_count =
+        Regex.scan(~r/androidx\.appcompat:appcompat:1\.6\.1/, result) |> length()
+
+      assert appcompat_count == 1
+    end
+
+    test "inserts inside the dependencies block (before its closing brace)" do
+      deps = ["com.example:foo:1.0.0"]
+      result = NativeBuild.__merge_gradle_deps__(@gradle, deps)
+
+      # The new implementation line lives between `dependencies {` and the next
+      # closing `}` — not floating at end-of-file.
+      [{deps_open, _}] = Regex.run(~r/dependencies\s*\{/, result, return: :index)
+      foo_idx = :binary.match(result, "com.example:foo:1.0.0") |> elem(0)
+      # Find the closing brace of the dependencies block (first `}` after deps_open).
+      close_idx =
+        (binary_part(result, deps_open, byte_size(result) - deps_open)
+         |> :binary.match("}")
+         |> elem(0)) + deps_open
+
+      assert deps_open < foo_idx
+      assert foo_idx < close_idx
+    end
+
+    test "is idempotent — running twice gives the same result" do
+      deps = ["com.github.PhilJay:MPAndroidChart:v3.1.0"]
+      once = NativeBuild.__merge_gradle_deps__(@gradle, deps)
+      twice = NativeBuild.__merge_gradle_deps__(once, deps)
+      assert once == twice
+    end
+
+    test "falls back to appending a fresh dependencies block when none exists" do
+      content = """
+      plugins {
+          id 'com.android.application'
+      }
+      """
+
+      result =
+        NativeBuild.__merge_gradle_deps__(content, ["com.example:foo:1.0.0"])
+
+      assert String.contains?(result, "dependencies {")
+      assert String.contains?(result, ~s(implementation "com.example:foo:1.0.0"))
     end
   end
 
@@ -382,16 +1222,18 @@ defmodule MobDev.NativeBuildTest do
 
   # ── Pythonx integration ────────────────────────────────────────────────────
 
-  describe "pythonx_in_project?/1" do
-    @tag :tmp_dir
-    test "false when no _build/dev/lib/pythonx", %{tmp_dir: tmp} do
-      refute NativeBuild.pythonx_in_project?(tmp)
+  describe "dep detection (deps_paths, not stale _build dirs — the MLX-404 lesson)" do
+    test "__dep_in_project__/2 keys on deps_paths" do
+      assert NativeBuild.__dep_in_project__(%{pythonx: "/deps/pythonx"}, :pythonx)
+      refute NativeBuild.__dep_in_project__(%{}, :pythonx)
     end
 
     @tag :tmp_dir
-    test "true when _build/dev/lib/pythonx exists", %{tmp_dir: tmp} do
+    test "a leftover _build/dev/lib/<dep> dir no longer counts", %{tmp_dir: tmp} do
       File.mkdir_p!(Path.join([tmp, "_build", "dev", "lib", "pythonx", "ebin"]))
-      assert NativeBuild.pythonx_in_project?(tmp)
+      # mob_dev itself deps neither pythonx nor emlx; the stale dir is ignored.
+      refute NativeBuild.pythonx_in_project?(tmp)
+      refute NativeBuild.emlx_in_project?(tmp)
     end
   end
 
@@ -625,8 +1467,12 @@ defmodule MobDev.NativeBuildTest do
       }
     end
 
-    test "nil device_id → first booted sim" do
-      assert NativeBuild.resolve_booted_udid(by_runtime(), nil) ==
+    test "nil device_id requires exactly one booted simulator" do
+      assert NativeBuild.resolve_booted_udid(by_runtime(), nil) == nil
+
+      [first | _rest] = by_runtime()["com.apple.CoreSimulator.SimRuntime.iOS-26-4"]
+
+      assert NativeBuild.resolve_booted_udid(%{"iOS" => [first]}, nil) ==
                "8A4250E9-B675-49CA-B143-A6C6D89B22AB"
     end
 
@@ -647,6 +1493,57 @@ defmodule MobDev.NativeBuildTest do
 
     test "no match → nil" do
       assert NativeBuild.resolve_booted_udid(by_runtime(), "12345678") == nil
+    end
+
+    test "ambiguous prefixes and duplicate entries fail closed" do
+      collision = %{
+        "iOS" => [
+          %{"udid" => "DEFD4BDC-1111-4CD2-93A1-62BE425E7A78", "state" => "Booted"},
+          %{"udid" => "DEFD4BDC-2222-4CD2-93A1-62BE425E7A78", "state" => "Booted"}
+        ]
+      }
+
+      assert NativeBuild.resolve_booted_udid(collision, "defd4bdc") == nil
+
+      duplicate = %{
+        "iOS" => [
+          %{"udid" => "DEFD4BDC-CA42-4CD2-93A1-62BE425E7A78", "state" => "Booted"},
+          %{"udid" => "DEFD4BDC-CA42-4CD2-93A1-62BE425E7A78", "state" => "Booted"}
+        ]
+      }
+
+      assert NativeBuild.resolve_booted_udid(duplicate, "defd4bdc") == nil
+    end
+
+    test "malformed inventories and identifiers fail closed" do
+      invalid_utf8 = <<255>>
+
+      malformed = [
+        nil,
+        %{"iOS" => :not_a_device_list},
+        %{"iOS" => [%{}]},
+        %{"iOS" => [%{"state" => "Unknown", "udid" => "VALID"}]},
+        %{"iOS" => [%{"state" => "Booted"}]},
+        %{"iOS" => [%{"state" => "Shutdown"}]},
+        %{"iOS" => [%{"udid" => nil, "state" => "Booted"}]},
+        %{"iOS" => [%{"udid" => "", "state" => "Booted"}]},
+        %{"iOS" => [%{"udid" => invalid_utf8, "state" => "Booted"}]},
+        %{"iOS" => [%{"udid" => "VALID", "state" => "Booted"} | :improper_tail]}
+      ]
+
+      Enum.each(malformed, fn inventory ->
+        assert NativeBuild.resolve_booted_udid(inventory, nil) == nil
+      end)
+
+      assert NativeBuild.resolve_booted_udid(
+               %{"iOS" => [%{"udid" => "VALID", "state" => "Booted"}]},
+               ""
+             ) == nil
+
+      assert NativeBuild.resolve_booted_udid(
+               %{"iOS" => [%{"udid" => "VALID", "state" => "Booted"}]},
+               invalid_utf8
+             ) == nil
     end
 
     test "empty booted list + nil device_id → nil" do
@@ -769,6 +1666,67 @@ defmodule MobDev.NativeBuildTest do
     end
   end
 
+  describe "project_nif_zig_args/1" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "project_nif_args_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+
+      old_static_nifs = Application.get_env(:mob_dev, :static_nifs)
+      cwd = File.cwd!()
+
+      on_exit(fn ->
+        if is_nil(old_static_nifs) do
+          Application.delete_env(:mob_dev, :static_nifs)
+        else
+          Application.put_env(:mob_dev, :static_nifs, old_static_nifs)
+        end
+
+        File.cd!(cwd)
+        File.rm_rf!(tmp)
+      end)
+
+      File.cd!(tmp)
+      :ok
+    end
+
+    test "adds per-ABI extra static archives to project_rust_libs and emits guard flag" do
+      Application.put_env(:mob_dev, :static_nifs, [
+        %{
+          module: :ghostty_vt,
+          archs: [:android_arm64],
+          guard: "MOB_STATIC_GHOSTTY_VT_NIF",
+          extra_static_libs: %{
+            android_arm64: "native/ghostty_vt/lib-android-arm64/libghostty-vt.a"
+          }
+        }
+      ])
+
+      assert {:ok, args} = NativeBuild.project_nif_zig_args(:android_arm64)
+
+      expected_lib = Path.expand("native/ghostty_vt/lib-android-arm64/libghostty-vt.a")
+      assert "-Dproject_rust_libs=#{expected_lib}" in args
+      assert "-Dghostty_vt_static=true" in args
+    end
+
+    test "does not add extra static archives or guard flags on non-matching ABIs" do
+      Application.put_env(:mob_dev, :static_nifs, [
+        %{
+          module: :ghostty_vt,
+          archs: [:android_arm64],
+          guard: "MOB_STATIC_GHOSTTY_VT_NIF",
+          extra_static_libs: %{
+            android_arm64: "native/ghostty_vt/lib-android-arm64/libghostty-vt.a"
+          }
+        }
+      ])
+
+      assert {:ok, args} = NativeBuild.project_nif_zig_args(:android_arm32)
+
+      assert "-Dproject_rust_libs=" in args
+      refute "-Dghostty_vt_static=true" in args
+    end
+  end
+
   # ── NxEigen integration helpers ──────────────────────────────────────────
   # Pure functions — no toolchain or filesystem touched.
 
@@ -810,6 +1768,86 @@ defmodule MobDev.NativeBuildTest do
       ios = NativeBuild.nxeigen_zig_args_ios("/x/libnx_eigen.a")
       android = NativeBuild.nxeigen_zig_args_android("/x/libnx_eigen.a")
       refute ios == android
+    end
+  end
+
+  describe "plugin_static_lib_args/1" do
+    test "empty list → no flag (so pre-plugin build.zig isn't passed an unknown -D)" do
+      assert NativeBuild.plugin_static_lib_args([]) == []
+    end
+
+    test "one archive → -Dplugin_static_libs=<path>" do
+      assert NativeBuild.plugin_static_lib_args(["/b/android_arm64/libnx_eigen_nif.a"]) ==
+               ["-Dplugin_static_libs=/b/android_arm64/libnx_eigen_nif.a"]
+    end
+
+    test "multiple archives → one comma-joined flag" do
+      args = NativeBuild.plugin_static_lib_args(["/b/liba.a", "/b/libb.a"])
+      assert args == ["-Dplugin_static_libs=/b/liba.a,/b/libb.a"]
+    end
+  end
+
+  describe "android_abi_to_cpp_target/1" do
+    test "arm64 ABI strings → :android_arm64" do
+      assert NativeBuild.android_abi_to_cpp_target("arm64-v8a") == :android_arm64
+      assert NativeBuild.android_abi_to_cpp_target("arm64") == :android_arm64
+    end
+
+    test "arm32 ABI strings → :android_arm32" do
+      assert NativeBuild.android_abi_to_cpp_target("armeabi-v7a") == :android_arm32
+      assert NativeBuild.android_abi_to_cpp_target("arm32") == :android_arm32
+    end
+
+    test "x86_64 → :android_x86_64 (a real target id CppArchive can't build yet)" do
+      assert NativeBuild.android_abi_to_cpp_target("x86_64") == :android_x86_64
+    end
+
+    test "unknown ABI strings → nil" do
+      assert NativeBuild.android_abi_to_cpp_target("riscv64") == nil
+      assert NativeBuild.android_abi_to_cpp_target("") == nil
+      assert NativeBuild.android_abi_to_cpp_target("x86") == nil
+    end
+  end
+
+  describe "cpp_archive_target_decision/2 + unsupported_cpp_archive_target_error/2" do
+    @cpp_spec %{plugin: :nx_cpu, module: :nx_cpu_nif}
+
+    test ":none when no cpp_archive spec is present (unsupported ABI is harmless then)" do
+      # The x86_64 emulator ABI gap only matters when a plugin actually needs it.
+      assert NativeBuild.cpp_archive_target_decision([], :android_x86_64) == :none
+    end
+
+    test "{:error, _} when a cpp_archive spec is present on an unsupported ABI (x86_64)" do
+      assert {:error, msg} =
+               NativeBuild.cpp_archive_target_decision([@cpp_spec], :android_x86_64)
+
+      # Names the unsupported ABI and the plugin/module, explains arm-only support.
+      assert msg =~ ":android_x86_64"
+      assert msg =~ "nx_cpu/nx_cpu_nif"
+      assert msg =~ ":android_arm64"
+      assert msg =~ ":android_arm32"
+    end
+
+    test ":build when a cpp_archive spec is present on a supported ABI" do
+      assert NativeBuild.cpp_archive_target_decision([@cpp_spec], :android_arm64) == :build
+      assert NativeBuild.cpp_archive_target_decision([@cpp_spec], :android_arm32) == :build
+      assert NativeBuild.cpp_archive_target_decision([@cpp_spec], :ios_sim) == :build
+    end
+
+    test "error message lists every active plugin/module" do
+      specs = [@cpp_spec, %{plugin: :other, module: :other_nif}]
+      msg = NativeBuild.unsupported_cpp_archive_target_error(specs, :android_x86_64)
+      assert msg =~ "nx_cpu/nx_cpu_nif"
+      assert msg =~ "other/other_nif"
+    end
+  end
+
+  describe "nxeigen_provided_by_plugin?/0" do
+    test "false when no cpp_archive plugin provides nx_eigen_nif_init (mob_dev's own env)" do
+      # mob_dev activates no plugins, so the legacy core NxEigen build stays the
+      # active path. (Guards the coexistence logic; the plugin-present case is
+      # covered by Merge.static_archives tests.)
+      refute NativeBuild.nxeigen_provided_by_plugin?()
     end
   end
 
@@ -1032,5 +2070,1549 @@ defmodule MobDev.NativeBuildTest do
       assert String.contains?(content, "iOS"), "patch should mention iOS"
       assert String.contains?(content, "iphoneos"), "patch should switch to iphoneos SDK"
     end
+  end
+
+  describe "__regen_formats__/2 (driver_tab format selection)" do
+    test "an app with existing tables keeps its format(s)" do
+      assert NativeBuild.__regen_formats__([:zig], false) == [:zig]
+      assert NativeBuild.__regen_formats__([:c], true) == [:c]
+      assert NativeBuild.__regen_formats__([:zig, :c], false) == [:zig, :c]
+    end
+
+    test "no existing table + no plugin NIFs → generate nothing (links against mob core)" do
+      assert NativeBuild.__regen_formats__([], false) == []
+    end
+
+    test "no existing table + a plugin NIF → create a zig table (the device fix)" do
+      # Without this, a plugin's <module>_nif_init links but never registers,
+      # so the NIF is :nif_not_loaded on device (caught verifying the showcase).
+      assert NativeBuild.__regen_formats__([], true) == [:zig]
+    end
+  end
+
+  describe "__prune_plugin_artifacts__/2 (the plugin-removal prune)" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "mob_prune_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      cwd = File.cwd!()
+      File.cd!(dir)
+      on_exit(fn -> File.cd!(cwd) end)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      {:ok, dir: dir}
+    end
+
+    defp touch!(rel) do
+      File.mkdir_p!(Path.dirname(rel))
+      File.write!(rel, "x")
+      rel
+    end
+
+    test "first run prunes nothing and records the current set" do
+      a = touch!("android/app/src/main/java/io/cam/CamBridge.kt")
+      assert NativeBuild.__prune_plugin_artifacts__(:android_kotlin, [a]) == []
+      assert File.exists?(a)
+      assert File.exists?("priv/generated/.mob_plugin_artifacts/android_kotlin")
+    end
+
+    test "a file dropped from the current set is deleted on the next run" do
+      cam = touch!("android/app/src/main/java/io/cam/CamBridge.kt")
+      loc = touch!("android/app/src/main/java/io/loc/LocBridge.kt")
+      NativeBuild.__prune_plugin_artifacts__(:android_kotlin, [cam, loc])
+
+      # mob_camera removed: next build only writes the location bridge.
+      pruned = NativeBuild.__prune_plugin_artifacts__(:android_kotlin, [loc])
+
+      assert pruned == [cam]
+      refute File.exists?(cam), "orphaned bridge should be pruned"
+      assert File.exists?(loc), "still-activated bridge must survive"
+    end
+
+    test "an empty current set (all plugins removed) prunes everything prior" do
+      a = touch!("priv/generated/plugin_assets/assets/plugin/cam/icon.png")
+      NativeBuild.__prune_plugin_artifacts__(:images, [a])
+
+      assert NativeBuild.__prune_plugin_artifacts__(:images, []) == [a]
+      refute File.exists?(a)
+    end
+
+    test "scopes are independent — pruning one never touches another" do
+      kt = touch!("android/app/src/main/java/io/cam/CamBridge.kt")
+      mig = touch!("priv/repo/migrations/20260101_cam.exs")
+      NativeBuild.__prune_plugin_artifacts__(:android_kotlin, [kt])
+      NativeBuild.__prune_plugin_artifacts__(:migrations, [mig])
+
+      # Re-run kotlin with nothing; the migration in another scope is untouched.
+      NativeBuild.__prune_plugin_artifacts__(:android_kotlin, [])
+
+      refute File.exists?(kt)
+      assert File.exists?(mig)
+    end
+
+    test "a ledgered path already gone (manually deleted) does not crash" do
+      a = touch!("android/app/src/main/java/io/cam/CamBridge.kt")
+      NativeBuild.__prune_plugin_artifacts__(:android_kotlin, [a])
+      File.rm!(a)
+
+      assert NativeBuild.__prune_plugin_artifacts__(:android_kotlin, []) == []
+    end
+  end
+
+  describe "zig_build_plan/3 (fail fast when the JNI build can't succeed)" do
+    test "no build.zig: nothing to do, regardless of zig or C sources" do
+      assert NativeBuild.zig_build_plan(false, false, false) == :skip_no_build_zig
+      assert NativeBuild.zig_build_plan(false, true, true) == :skip_no_build_zig
+      assert NativeBuild.zig_build_plan(false, false, true) == :skip_no_build_zig
+    end
+
+    test "zig present: drive the real build.zig path (C-source presence irrelevant)" do
+      assert NativeBuild.zig_build_plan(true, true, false) == :run_zig
+      assert NativeBuild.zig_build_plan(true, true, true) == :run_zig
+    end
+
+    test "no zig but the mob dep still ships C sources: CMake fallback can compile them" do
+      assert NativeBuild.zig_build_plan(true, false, true) == :legacy_cmake
+    end
+
+    test "no zig AND no C sources (mob 0.7+): obvious failure, so signal :zig_required" do
+      assert NativeBuild.zig_build_plan(true, false, false) == :zig_required
+    end
+  end
+
+  describe "zig_required_message/0" do
+    test "names the cause and the exact fix" do
+      msg = NativeBuild.zig_required_message()
+
+      # the cause: zig missing + the vanished C fallback source
+      assert msg =~ "zig is not on your PATH"
+      assert msg =~ "mob_nif.c"
+      # the fix: the version mob.doctor pins, plus how to verify
+      assert msg =~ "zig 0.15"
+      assert msg =~ "mix mob.doctor"
+    end
+
+    test "stays in plain prose (no em dashes leaking into user-facing output)" do
+      refute NativeBuild.zig_required_message() =~ "—"
+    end
+  end
+
+  describe "Android update-only native install" do
+    test "fails closed when discovery resolves no update targets" do
+      parent = self()
+
+      runner = fn command, args ->
+        send(parent, {:command, command, args})
+        {"List of devices attached\n", 0}
+      end
+
+      assert {:error, :no_targets} =
+               NativeBuild.resolve_android_update_targets(nil, runner)
+
+      assert_received {:command, "adb", ["devices"]}
+      refute_received {:command, _, _}
+    end
+
+    test "default fanout canonicalizes every ready serial before the device phase" do
+      runner = fn "adb", ["devices"] ->
+        {"""
+         * daemon not running; starting now at tcp:5037
+         * daemon started successfully
+         List of devices attached
+         serial-b\tdevice
+         serial-a\tdevice
+         """, 0}
+      end
+
+      assert {:ok, ["serial-a", "serial-b"]} =
+               NativeBuild.resolve_android_update_targets(nil, runner)
+    end
+
+    test "implicit fanout rejects mixed offline, unauthorized, and unknown states" do
+      cases = [
+        {"offline", :offline},
+        {"unauthorized", :unauthorized},
+        {"recovery", :unknown_state}
+      ]
+
+      Enum.each(cases, fn {state, reason} ->
+        output = "List of devices attached\nready\tdevice\nblocked\t#{state}\n"
+        runner = fn "adb", ["devices"] -> {output, 0} end
+
+        assert {:error, ^reason} =
+                 NativeBuild.resolve_android_update_targets(nil, runner)
+      end)
+    end
+
+    test "rejects duplicate and malformed discovery snapshots" do
+      duplicate = "List of devices attached\nserial-a\tdevice\nserial-a\tdevice\n"
+      malformed = "List of devices attached\nserial-a\tdevice\textra\n"
+
+      assert {:error, :duplicate_target} =
+               NativeBuild.resolve_android_update_targets(
+                 nil,
+                 fn "adb", ["devices"] -> {duplicate, 0} end
+               )
+
+      for output <- [malformed, "serial-a\tdevice\n", <<255, 254>>] do
+        assert {:error, :malformed_discovery} =
+                 NativeBuild.resolve_android_update_targets(
+                   nil,
+                   fn "adb", ["devices"] -> {output, 0} end
+                 )
+      end
+    end
+
+    test "accepts exactly 32 maximum-length serials and rejects larger target sets" do
+      serials =
+        for index <- 1..33 do
+          prefix = Integer.to_string(index)
+          prefix <> String.duplicate("a", 128 - byte_size(prefix))
+        end
+
+      output = fn selected ->
+        "List of devices attached\n" <>
+          Enum.map_join(selected, "", &"#{&1}\tdevice\n")
+      end
+
+      accepted = Enum.take(serials, 32)
+
+      canonical_accepted = Enum.sort(accepted)
+
+      assert {:ok, ^canonical_accepted} =
+               NativeBuild.resolve_android_update_targets(
+                 nil,
+                 fn "adb", ["devices"] -> {output.(accepted), 0} end
+               )
+
+      assert {:error, :too_many_targets} =
+               NativeBuild.resolve_android_update_targets(
+                 nil,
+                 fn "adb", ["devices"] -> {output.(serials), 0} end
+               )
+    end
+
+    test "rejects oversized discovery output instead of parsing a truncated prefix" do
+      output = "List of devices attached\n" <> String.duplicate("x", 8_193)
+
+      assert {:error, :discovery_output_too_large} =
+               NativeBuild.resolve_android_update_targets(
+                 nil,
+                 fn "adb", ["devices"] -> {output, 0} end
+               )
+    end
+
+    test "resolves only the requested online serial, including a bare WiFi address" do
+      output = """
+      List of devices attached
+      ZY22K6BSJM\tdevice
+      10.0.0.17:5555\tdevice
+      emulator-5554\tdevice
+      """
+
+      runner = fn "adb", ["devices"] -> {output, 0} end
+
+      assert {:ok, ["10.0.0.17:5555"]} =
+               NativeBuild.resolve_android_update_targets("10.0.0.17", runner)
+    end
+
+    test "fails closed for offline, unauthorized, missing, ambiguous, and invalid targets" do
+      runner = fn "adb", ["devices"] ->
+        {"""
+         List of devices attached
+         offline-one\toffline
+         auth-one\tunauthorized
+         10.0.0.17\tdevice
+         10.0.0.17:5555\tdevice
+         """, 0}
+      end
+
+      assert {:error, :offline} =
+               NativeBuild.resolve_android_update_targets("offline-one", runner)
+
+      assert {:error, :unauthorized} =
+               NativeBuild.resolve_android_update_targets("auth-one", runner)
+
+      assert {:error, :target_not_connected} =
+               NativeBuild.resolve_android_update_targets("missing", runner)
+
+      assert {:error, :ambiguous_target} =
+               NativeBuild.resolve_android_update_targets("10.0.0.17", runner)
+
+      assert {:error, :invalid_target} =
+               NativeBuild.resolve_android_update_targets("--transport-any", runner)
+    end
+
+    test "explicit resolution rejects a case-variant discovery collision before mutation" do
+      parent = self()
+
+      runner = fn
+        "adb", ["devices"] = args ->
+          send(parent, {:command, "adb", args})
+
+          {"List of devices attached\nCaseTarget\tdevice\ncasetarget\tdevice\n", 0}
+
+        command, args ->
+          send(parent, {:command, command, args})
+          {"Success\n", 0}
+      end
+
+      assert {:error, :ambiguous_target} =
+               NativeBuild.resolve_android_update_targets("CaseTarget", runner)
+
+      assert_received {:command, "adb", ["devices"]}
+      refute_received {:command, _, _}
+    end
+
+    test "legacy install and delivery seams require the authoritative transaction" do
+      parent = self()
+      apk = "/tmp/app-debug.apk"
+
+      runner = fn
+        "adb", ["devices"] = args ->
+          send(parent, {:command, "adb", args})
+          {"List of devices attached\nCaseTarget\tdevice\n", 0}
+
+        command, args ->
+          send(parent, {:command, command, args})
+          {"Success\n", 0}
+      end
+
+      deliver = fn serial ->
+        send(parent, {:delivered, serial})
+        :ok
+      end
+
+      assert {:ok, ["CaseTarget"]} =
+               NativeBuild.resolve_android_update_targets("CaseTarget", runner)
+
+      assert {:error, :authoritative_transaction_required} =
+               apply(NativeBuild, :install_android_updates, [apk, ["CaseTarget"], runner])
+
+      assert {:error, message} =
+               apply(NativeBuild, :install_and_deliver_android, [
+                 apk,
+                 ["CaseTarget"],
+                 runner,
+                 deliver
+               ])
+
+      assert message =~ "authoritative payload transaction"
+      assert_received {:command, "adb", ["devices"]}
+      refute_received {:command, _, _}
+      refute_received {:delivered, _}
+    end
+
+    test "accepts only recognized adb success output" do
+      assert :updated = NativeBuild.interpret_adb_update("Success\n", 0)
+
+      assert :updated =
+               NativeBuild.interpret_adb_update("Performing Streamed Install\nSuccess\n", 0)
+
+      assert {:failed, :suspicious_success} =
+               NativeBuild.interpret_adb_update("Success\nunexpected extra line\n", 0)
+
+      assert {:failed, :suspicious_success} = NativeBuild.interpret_adb_update("", 0)
+      assert {:failed, :unknown_failure} = NativeBuild.interpret_adb_update("Success\n", 1)
+      assert {:failed, :unknown_failure} = NativeBuild.interpret_adb_update(<<255, 254>>, 0)
+    end
+
+    test "accepts exactly 4096 verified bytes and rejects every oversized install result" do
+      exact = "Success" <> String.duplicate("\n", 4_096 - byte_size("Success"))
+      assert byte_size(exact) == 4_096
+      assert :updated = NativeBuild.interpret_adb_update(exact, 0)
+
+      assert {:failed, :unknown_failure} =
+               NativeBuild.interpret_adb_update(exact <> "\n", 0)
+
+      assert {:failed, :unknown_failure} =
+               NativeBuild.interpret_adb_update(
+                 exact <> "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]\n",
+                 0
+               )
+    end
+
+    test "classifies destructive and recoverable adb failures without returning raw output" do
+      cases = [
+        {"Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE] raw-private-detail",
+         :insufficient_storage},
+        {"Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE] raw-private-detail", :signature_mismatch},
+        {"Failure [INSTALL_PARSE_FAILED_INCONSISTENT_CERTIFICATES]", :signature_mismatch},
+        {"Failure [INSTALL_FAILED_VERSION_DOWNGRADE]", :version_downgrade},
+        {"error: device offline", :offline},
+        {"error: device unauthorized. Please check the confirmation dialog", :unauthorized},
+        {"error: device not found", :unavailable},
+        {"Failure [INSTALL_FAILED_DEXOPT]", :install_rejected},
+        {"some unrecognized failure containing raw-private-detail", :unknown_failure}
+      ]
+
+      Enum.each(cases, fn {output, reason} ->
+        result = NativeBuild.interpret_adb_update(output, 1)
+        assert result == {:failed, reason}
+        refute inspect(result) =~ "raw-private-detail"
+      end)
+    end
+
+    test "legacy seams still reject invalid target sets without invoking callbacks" do
+      parent = self()
+
+      runner = fn command, args ->
+        send(parent, {:command, command, args})
+        {"unexpected", 0}
+      end
+
+      deliver = fn serial ->
+        send(parent, {:delivered, serial})
+        :ok
+      end
+
+      assert {:error, :invalid_target} =
+               NativeBuild.resolve_android_update_targets("--all", runner)
+
+      assert {:error, :no_explicit_targets} =
+               apply(NativeBuild, :install_android_updates, ["/tmp/app.apk", [], runner])
+
+      assert {:error, :invalid_target} =
+               apply(NativeBuild, :install_android_updates, [
+                 "/tmp/app.apk",
+                 ["--all"],
+                 runner
+               ])
+
+      assert {:error, _message} =
+               apply(NativeBuild, :install_and_deliver_android, [
+                 "/tmp/app.apk",
+                 ["CaseTarget", "casetarget"],
+                 runner,
+                 deliver
+               ])
+
+      refute_received {:command, _, _}
+      refute_received {:delivered, _}
+    end
+  end
+
+  describe "plist_array_additions/2 (plugin array plist merge, e.g. UIBackgroundModes)" do
+    test "returns items not already present, input order preserved" do
+      assert NativeBuild.plist_array_additions(
+               ["audio"],
+               ["bluetooth-central", "bluetooth-peripheral"]
+             ) == ["bluetooth-central", "bluetooth-peripheral"]
+    end
+
+    test "skips items already on disk (idempotent re-merge)" do
+      assert NativeBuild.plist_array_additions(
+               ["audio", "bluetooth-central"],
+               ["bluetooth-central", "bluetooth-peripheral"]
+             ) == ["bluetooth-peripheral"]
+    end
+
+    test "de-duplicates within the requested items" do
+      assert NativeBuild.plist_array_additions([], ["x", "x", "y"]) == ["x", "y"]
+    end
+
+    test "drops non-binary entries" do
+      assert NativeBuild.plist_array_additions([], ["ok", :atom, 1, nil]) == ["ok"]
+    end
+
+    test "empty when everything is already present" do
+      assert NativeBuild.plist_array_additions(["a", "b"], ["a", "b"]) == []
+    end
+  end
+
+  describe "build_file_supports_plugins?/1 (MOB-7: blank-iOS mob_register_plugins link)" do
+    test "true when the iOS build file exposes the plugin_swift_files option" do
+      src = ~s|
+        const plugin_swift_files = b.option([]const u8, "plugin_swift_files", "…") orelse "";
+        const plugin_frameworks = b.option([]const u8, "plugin_frameworks", "…") orelse "";
+      |
+
+      assert NativeBuild.build_file_supports_plugins?(src)
+    end
+
+    test "false for a pre-plugin build file (no plugin_swift_files option)" do
+      src = ~s|
+        const mob_dir = b.option([]const u8, "mob_dir", "…") orelse "";
+        const sdkroot = b.option([]const u8, "sdkroot", "…") orelse "";
+      |
+
+      refute NativeBuild.build_file_supports_plugins?(src)
+    end
+
+    test "false for empty content" do
+      refute NativeBuild.build_file_supports_plugins?("")
+    end
+  end
+
+  describe "ios_plugin_swift_mode/2 (MOB-7: the actual bootstrap decision)" do
+    # This is the fix. The :bootstrap_only case — no plugins activated, but the
+    # build file supports plugins (so its AppDelegate calls mob_register_plugins)
+    # — is what a --blank iOS app needs; flipping it back to :none reintroduces
+    # the undefined-symbol link failure.
+    test "no plugins + plugin-aware build file => :bootstrap_only (the MOB-7 fix)" do
+      assert NativeBuild.ios_plugin_swift_mode([], true) == :bootstrap_only
+    end
+
+    test "no plugins + legacy build file => :none (omit flags, keep legacy building)" do
+      assert NativeBuild.ios_plugin_swift_mode([], false) == :none
+    end
+
+    test "activated plugins => :with_plugins regardless of build-file support" do
+      assert NativeBuild.ios_plugin_swift_mode([{"dir", %{}}], true) == :with_plugins
+      assert NativeBuild.ios_plugin_swift_mode([{"dir", %{}}], false) == :with_plugins
+    end
+  end
+
+  describe "ios_build_file_supports_plugins?/1 (file-read wrapper)" do
+    @describetag :tmp_dir
+
+    test "true when the file exists and declares the option", %{tmp_dir: dir} do
+      path = Path.join(dir, "build.zig")
+      File.write!(path, ~s|const plugin_swift_files = b.option(...);|)
+      assert NativeBuild.ios_build_file_supports_plugins?(path)
+    end
+
+    test "false when the file exists without the option", %{tmp_dir: dir} do
+      path = Path.join(dir, "build.zig")
+      File.write!(path, ~s|const mob_dir = b.option(...);|)
+      refute NativeBuild.ios_build_file_supports_plugins?(path)
+    end
+
+    test "false when the file is missing (legacy scaffold, no build.zig)", %{tmp_dir: dir} do
+      refute NativeBuild.ios_build_file_supports_plugins?(Path.join(dir, "does_not_exist.zig"))
+    end
+  end
+
+  describe "remove_stale_release_otp_zip/1" do
+    @describetag :tmp_dir
+
+    # Regression guard: `mix mob.release --android` used to write
+    # `assets/otp.zip` into the shared `src/main/assets/` source set, which
+    # Gradle merges into every build variant. A checkout that had ever run a
+    # release build carried that file into every subsequent debug build too,
+    # where MobBridge.kt's extractOtpIfNeeded() would re-extract it on the
+    # next app launch and silently overwrite freshly pushed dev BEAMs with
+    # the stale release snapshot. Release builds now write to the
+    # variant-scoped `src/release/assets/` instead, but existing checkouts
+    # may still carry the leftover file — the debug build path removes it
+    # so it can't keep poisoning deploys.
+    test "removes a leftover otp.zip from the shared main asset source set", %{tmp_dir: dir} do
+      assets_dir = Path.join([dir, "app", "src", "main", "assets"])
+      File.mkdir_p!(assets_dir)
+      stale = Path.join(assets_dir, "otp.zip")
+      File.write!(stale, "stale release bundle")
+
+      assert NativeBuild.remove_stale_release_otp_zip(dir) == :ok
+      refute File.exists?(stale)
+    end
+
+    test "is a no-op when no stale zip is present", %{tmp_dir: dir} do
+      assert NativeBuild.remove_stale_release_otp_zip(dir) == :ok
+    end
+
+    test "leaves sibling assets (e.g. logos) untouched", %{tmp_dir: dir} do
+      assets_dir = Path.join([dir, "app", "src", "main", "assets"])
+      File.mkdir_p!(assets_dir)
+      File.write!(Path.join(assets_dir, "otp.zip"), "stale")
+      logo = Path.join(assets_dir, "mob_logo_dark.png")
+      File.write!(logo, "logo bytes")
+
+      NativeBuild.remove_stale_release_otp_zip(dir)
+
+      assert File.exists?(logo)
+    end
+  end
+
+  describe "install_and_deliver_android_runtime/8 authoritative transaction" do
+    @describetag :tmp_dir
+
+    test "requires authoritative callbacks before any device command", %{tmp_dir: dir} do
+      fixture = authoritative_android_fixture!(dir, ["serial-a"])
+
+      runner = fn executable, args ->
+        send(self(), {:native_probe, executable, args})
+        {"unexpected", 0}
+      end
+
+      assert {:error, reason} =
+               NativeBuild.install_and_deliver_android_runtime(
+                 fixture.apk,
+                 fixture.serials,
+                 fixture.package,
+                 fixture.elixir_lib,
+                 fixture.otp_arm64,
+                 fixture.otp_arm32,
+                 fixture.otp_x86_64,
+                 probe_runner: runner,
+                 tmp_root: dir
+               )
+
+      assert reason =~ "authoritative payload plan"
+      refute_received {:native_probe, _, _}
+    end
+
+    test "installs the immutable plan APK and returns a native_ready set-wide lease", %{
+      tmp_dir: dir
+    } do
+      fixture = authoritative_android_fixture!(dir, ["serial-a"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      probe_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+      otp_runner = authoritative_android_otp_runner(self())
+
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+      cleanup = fn plan -> cleanup_authoritative_android_plan(plan) end
+
+      assert {:ok,
+              %{
+                deploy_lock: %{phase: :native_ready, state: :held_success} = lease,
+                payload_plan: plan
+              }} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 otp_runner,
+                 preinstall,
+                 cleanup
+               )
+
+      assert lease.owner == "ownerproof000001"
+      assert lease.serials == ["serial-a"]
+
+      commands = drain_native_commands(:native_probe)
+
+      assert Enum.any?(commands, fn
+               {"adb", ["-s", "serial-a", "install", "-r", installed_apk]} ->
+                 installed_apk == plan.apk.path and installed_apk != fixture.apk
+
+               _command ->
+                 false
+             end)
+
+      assert File.regular?(plan.apk.path)
+      assert cleanup_authoritative_android_plan(plan) == :ok
+    end
+
+    test "recovery proof uses the native two-arity adb runner and refuses before mutation", %{
+      tmp_dir: dir
+    } do
+      fixture = authoritative_android_fixture!(dir, ["serial-a"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      base_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+
+      probe_runner = fn
+        "adb", ["devices", "-l"] = args ->
+          send(self(), {:native_probe, "adb", args})
+          {"List of devices attached\n", 0}
+
+        executable, args ->
+          base_runner.(executable, args)
+      end
+
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+
+      cleanup = fn plan ->
+        send(self(), {:recovery_payload_cleanup, plan.attempt_id})
+        cleanup_authoritative_android_plan(plan)
+      end
+
+      assert {:error,
+              "Android native-ready recovery proof was refused (transport_identity_mismatch)"} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 authoritative_android_otp_runner(self()),
+                 preinstall,
+                 cleanup,
+                 resume_native_ready: true,
+                 android_recovery_opts: [
+                   host_lock_held?: fn -> true end,
+                   apk_signature_verified?: fn _path -> true end
+                 ]
+               )
+
+      assert_received {:native_probe, "adb", ["devices", "-l"]}
+      assert_received {:recovery_payload_cleanup, _attempt_id}
+
+      refute Enum.any?(drain_native_commands(:native_probe), fn
+               {"adb", ["-s", _serial, "install", "-r", _apk]} ->
+                 true
+
+               {"adb", ["-s", _serial, "shell", command]} ->
+                 String.contains?(command, "record_next_")
+
+               _command ->
+                 false
+             end)
+    end
+
+    test "recovery validates the immutable plan without requiring its discarded source path", %{
+      tmp_dir: dir
+    } do
+      fixture = authoritative_android_fixture!(dir, ["serial-a"])
+      apk_identity = authoritative_android_file_identity!(fixture.apk)
+
+      input = %{
+        apk: fixture.apk,
+        apk_size: apk_identity.size,
+        apk_sha256: apk_identity.sha256,
+        bundle_id: fixture.package,
+        serials: fixture.serials,
+        selected_abis: ["arm64-v8a"],
+        selected_abis_by_serial: %{"serial-a" => "arm64-v8a"}
+      }
+
+      plan = authoritative_android_payload_plan!(dir, input)
+
+      selections = %{
+        "serial-a" => %{abi: "arm64-v8a", otp_dir: fixture.otp_arm64}
+      }
+
+      assert {:error, :invalid_recovery_payload} =
+               NativeBuild.validate_android_recovery_payload(plan)
+
+      assert :ok = NativeBuild.validate_android_recovery_payload(plan, selections)
+
+      assert {:error, :invalid_recovery_payload} =
+               NativeBuild.validate_android_recovery_payload(plan, %{
+                 "serial-a" => %{abi: "arm64-v8a"}
+               })
+
+      assert cleanup_authoritative_android_plan(plan) == :ok
+    end
+
+    test "canonicalizes one unsorted target set before planning and every mutation", %{
+      tmp_dir: dir
+    } do
+      fixture = authoritative_android_fixture!(dir, ["serial-b", "serial-a"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      probe_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+      otp_runner = authoritative_android_otp_runner(self())
+
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+      cleanup = fn plan -> cleanup_authoritative_android_plan(plan) end
+
+      assert {:ok,
+              %{
+                deploy_lock: %{serials: ["serial-a", "serial-b"], phase: :native_ready},
+                payload_plan: %{serials: ["serial-a", "serial-b"]} = plan
+              }} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 otp_runner,
+                 preinstall,
+                 cleanup
+               )
+
+      install_serials =
+        for {"adb", ["-s", serial, "install", "-r", _apk]} <-
+              drain_native_commands(:native_probe),
+            do: serial
+
+      assert install_serials == ["serial-a", "serial-b"]
+      assert cleanup_authoritative_android_plan(plan) == :ok
+    end
+
+    test "rejects empty, oversized, duplicate, ambiguous, and unbounded sets before work", %{
+      tmp_dir: dir
+    } do
+      fixture = authoritative_android_fixture!(dir, ["fixture-serial"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      probe_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+      otp_runner = authoritative_android_otp_runner(self())
+
+      invalid_sets = [
+        {[], "Android APK update requires at least one explicit target"},
+        {Enum.map(1..33, &"serial-#{&1}"),
+         "Android APK update target count exceeds the safety limit"},
+        {["serial-a", "serial-a"], "Android APK update request is invalid"},
+        {["serial-a", "SERIAL-A"], "Android APK update request is invalid"},
+        {[String.duplicate("a", 129)], "Android APK update request is invalid"},
+        {["serial-a" | "invalid-tail"], "Android APK update request is invalid"}
+      ]
+
+      for {serials, expected_reason} <- invalid_sets do
+        invalid_fixture = %{fixture | serials: serials}
+
+        preinstall = fn _input ->
+          send(self(), :unexpected_preinstall)
+          {:error, :unexpected}
+        end
+
+        cleanup = fn _plan ->
+          send(self(), :unexpected_cleanup)
+          :ok
+        end
+
+        assert {:error, ^expected_reason} =
+                 run_authoritative_android(
+                   invalid_fixture,
+                   dir,
+                   probe_runner,
+                   otp_runner,
+                   preinstall,
+                   cleanup
+                 )
+      end
+
+      refute_received :unexpected_preinstall
+      refute_received :unexpected_cleanup
+      refute_received {:native_probe, _, _}
+      refute_received {:native_otp, _, _}
+    end
+
+    test "accepts only the bounded binary beam-flags payload contract", %{tmp_dir: dir} do
+      fixture = authoritative_android_fixture!(dir, ["serial-a"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      probe_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+      otp_runner = authoritative_android_otp_runner(self())
+
+      preinstall = fn input ->
+        plan = authoritative_android_payload_plan!(dir, input)
+        {:ok, put_in(plan.beam.beam_flags, "+S 2:2 -A 4")}
+      end
+
+      cleanup = fn plan -> cleanup_authoritative_android_plan(plan) end
+
+      assert {:ok, %{deploy_lock: %{phase: :native_ready}, payload_plan: plan}} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 otp_runner,
+                 preinstall,
+                 cleanup
+               )
+
+      assert plan.beam.beam_flags == "+S 2:2 -A 4"
+      assert cleanup_authoritative_android_plan(plan) == :ok
+
+      for invalid_flags <- [["+S", "2:2"], String.duplicate("x", 4_097), <<0xFF>>] do
+        invalid_preinstall = fn input ->
+          invalid_plan = authoritative_android_payload_plan!(dir, input)
+          {:ok, put_in(invalid_plan.beam.beam_flags, invalid_flags)}
+        end
+
+        assert {:error, "Authoritative Android payload plan identity is invalid"} =
+                 run_authoritative_android(
+                   fixture,
+                   dir,
+                   probe_runner,
+                   otp_runner,
+                   invalid_preinstall,
+                   fn _plan -> {:error, :injected_cleanup_failure} end
+                 )
+      end
+
+      commands = drain_native_commands(:native_probe)
+      assert Enum.count(commands, &native_install_command?/1) == 1
+      assert Enum.count(commands, &native_lock_mutation_command?/1) > 0
+
+      Enum.each(Path.wildcard(Path.join(dir, "authoritative-plan-*.apk")), &File.rm!/1)
+      Enum.each(Path.wildcard(Path.join(dir, "authoritative-beams-*.tar")), &File.rm!/1)
+    end
+
+    test "rejects no-restart plans, invokes cleanup once, and performs zero lease or install mutation",
+         %{tmp_dir: dir} do
+      fixture = authoritative_android_fixture!(dir, ["serial-a"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      probe_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+      otp_runner = authoritative_android_otp_runner(self())
+
+      preinstall = fn input ->
+        plan = authoritative_android_payload_plan!(dir, input)
+
+        restart = %{
+          Map.fetch!(plan.restart_by_serial, "serial-a")
+          | restart?: false,
+            mode: :no_restart
+        }
+
+        {:ok, put_in(plan.restart_by_serial["serial-a"], restart)}
+      end
+
+      cleanup = fn plan ->
+        send(self(), {:payload_cleanup, plan.attempt_id})
+        {:error, :injected_cleanup_failure}
+      end
+
+      assert {:error, "Authoritative Android payload plan identity is invalid"} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 otp_runner,
+                 preinstall,
+                 cleanup
+               )
+
+      assert_received {:payload_cleanup, "planbeam00000001"}
+
+      commands = drain_native_commands(:native_probe)
+      refute Enum.any?(commands, &native_install_command?/1)
+      refute Enum.any?(commands, &native_lock_mutation_command?/1)
+
+      [leaked_apk] = Path.wildcard(Path.join(dir, "authoritative-plan-*.apk"))
+      File.rm!(leaked_apk)
+      Enum.each(Path.wildcard(Path.join(dir, "authoritative-beams-*.tar")), &File.rm!/1)
+    end
+
+    test "cleanup failure cannot replace a primary device error or its exact retained lease", %{
+      tmp_dir: dir
+    } do
+      fixture = authoritative_android_fixture!(dir, ["serial-a"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      base_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+
+      probe_runner = fn
+        "adb", ["-s", "serial-a", "install", "-r", _apk] = args ->
+          send(self(), {:native_probe, "adb", args})
+          {"Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]\n", 1}
+
+        executable, args ->
+          base_runner.(executable, args)
+      end
+
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+
+      cleanup = fn plan ->
+        send(self(), {:payload_cleanup, plan.attempt_id})
+        {:error, :injected_cleanup_failure}
+      end
+
+      assert {:error, reason,
+              %{
+                owner: "ownerproof000001",
+                state: :retained_failure,
+                phase: :acquired,
+                serials: ["serial-a"]
+              }} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 authoritative_android_otp_runner(self()),
+                 preinstall,
+                 cleanup
+               )
+
+      assert reason == "APK update failed: out of storage"
+      assert_received {:payload_cleanup, "planbeam00000001"}
+      refute_received {:payload_cleanup, "planbeam00000001"}
+
+      Enum.each(Path.wildcard(Path.join(dir, "authoritative-plan-*.apk")), &File.rm!/1)
+      Enum.each(Path.wildcard(Path.join(dir, "authoritative-beams-*.tar")), &File.rm!/1)
+    end
+
+    test "cleanup throw cannot replace a primary raised exception and runs exactly once", %{
+      tmp_dir: dir
+    } do
+      fixture = authoritative_android_fixture!(dir, ["serial-a"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      probe_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+      base_otp_runner = authoritative_android_otp_runner(self())
+
+      otp_runner = fn
+        "cp", _args, _opts -> raise "primary OTP preparation failure"
+        executable, args, opts -> base_otp_runner.(executable, args, opts)
+      end
+
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+
+      cleanup = fn plan ->
+        send(self(), {:payload_cleanup, plan.attempt_id})
+        throw(:secondary_cleanup_failure)
+      end
+
+      assert_raise RuntimeError, "primary OTP preparation failure", fn ->
+        run_authoritative_android(
+          fixture,
+          dir,
+          probe_runner,
+          otp_runner,
+          preinstall,
+          cleanup
+        )
+      end
+
+      assert_received {:payload_cleanup, "planbeam00000001"}
+      refute_received {:payload_cleanup, "planbeam00000001"}
+
+      Enum.each(Path.wildcard(Path.join(dir, "authoritative-plan-*.apk")), &File.rm!/1)
+      Enum.each(Path.wildcard(Path.join(dir, "authoritative-beams-*.tar")), &File.rm!/1)
+    end
+
+    test "freezes OTP archives and refuses every second-target mutation after archive drift", %{
+      tmp_dir: dir
+    } do
+      fixture = authoritative_android_fixture!(dir, ["serial-a", "serial-b"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      archive_state = start_supervised!({Agent, fn -> nil end}, id: :otp_archive_state)
+      probe_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+
+      otp_runner =
+        authoritative_android_otp_runner(self(), fn
+          ["-s", "serial-a", "push", archive, _remote] ->
+            Agent.update(archive_state, fn _old -> archive end)
+
+          ["-s", "serial-a", "shell", "rm -f " <> _remote] ->
+            archive = Agent.get(archive_state, & &1)
+            File.chmod!(archive, 0o600)
+            File.write!(archive, "mutated between canonical targets")
+
+          _args ->
+            :ok
+        end)
+
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+
+      cleanup = fn plan ->
+        send(self(), {:payload_cleanup, plan.attempt_id})
+        cleanup_authoritative_android_plan(plan)
+      end
+
+      assert {:error, {:partial_update, reason}, %{state: :retained_failure, phase: :acquired}} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 otp_runner,
+                 preinstall,
+                 cleanup
+               )
+
+      assert reason =~ "OTP archive changed"
+      assert_received {:payload_cleanup, "planbeam00000001"}
+      refute_received {:payload_cleanup, "planbeam00000001"}
+      probe_commands = drain_native_commands(:native_probe)
+      otp_commands = drain_native_commands(:native_otp)
+
+      refute Enum.any?(probe_commands, fn
+               {"adb", ["-s", "serial-b", "install" | _args]} -> true
+               _command -> false
+             end)
+
+      refute Enum.any?(otp_commands, fn
+               {"adb", ["-s", "serial-b" | _args]} -> true
+               _command -> false
+             end)
+    end
+
+    test "set-wide owner loss after target A prevents every target B mutation", %{tmp_dir: dir} do
+      fixture = authoritative_android_fixture!(dir, ["serial-a", "serial-b"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      probe_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+
+      otp_runner =
+        authoritative_android_otp_runner(self(), fn
+          ["-s", "serial-a", "shell", "rm -f " <> _remote] ->
+            Agent.update(owner_state, fn _valid -> false end)
+
+          _args ->
+            :ok
+        end)
+
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+
+      cleanup = fn plan ->
+        cleanup_authoritative_android_plan(plan)
+      end
+
+      assert {:error, {:partial_update, reason},
+              %{state: :retained_ambiguous, phase: :acquired, serials: ["serial-a", "serial-b"]}} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 otp_runner,
+                 preinstall,
+                 cleanup
+               )
+
+      assert reason =~ "lease set could not be verified"
+      probe_commands = drain_native_commands(:native_probe)
+      otp_commands = drain_native_commands(:native_otp)
+
+      refute Enum.any?(probe_commands, fn
+               {"adb", ["-s", "serial-b", "install" | _args]} -> true
+               _command -> false
+             end)
+
+      refute Enum.any?(otp_commands, fn
+               {"adb", ["-s", "serial-b" | _args]} -> true
+               _command -> false
+             end)
+    end
+
+    test "non-authoritative install success retains an ambiguous lease and stops later targets",
+         %{tmp_dir: dir} do
+      fixture = authoritative_android_fixture!(dir, ["serial-a", "serial-b"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      base_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+
+      probe_runner = fn
+        "adb", ["-s", "serial-a", "install", "-r", _apk] = args ->
+          send(self(), {:native_probe, "adb", args})
+          {"Success\nuntrusted trailing output\n", 0}
+
+        executable, args ->
+          base_runner.(executable, args)
+      end
+
+      otp_runner = authoritative_android_otp_runner(self())
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+      cleanup = fn plan -> cleanup_authoritative_android_plan(plan) end
+
+      assert {:error, {:partial_update, reason},
+              %{state: :retained_ambiguous, phase: :acquired, serials: ["serial-a", "serial-b"]}} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 otp_runner,
+                 preinstall,
+                 cleanup
+               )
+
+      assert reason =~ "not authoritative"
+      probe_commands = drain_native_commands(:native_probe)
+      assert Enum.count(probe_commands, &native_install_command?/1) == 1
+
+      refute Enum.any?(probe_commands, fn
+               {"adb", ["-s", "serial-b", "install" | _args]} -> true
+               _command -> false
+             end)
+
+      refute Enum.any?(drain_native_commands(:native_otp), fn
+               {"adb", _args} -> true
+               _local_command -> false
+             end)
+    end
+
+    test "a deterministic OTP failure after APK success reports a retained partial update", %{
+      tmp_dir: dir
+    } do
+      fixture = authoritative_android_fixture!(dir, ["serial-a", "serial-b"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      probe_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+
+      otp_runner = fn executable, args, opts ->
+        send(self(), {:native_otp, executable, args})
+
+        case {executable, args} do
+          {local, _args} when local in ["cp", "tar"] -> System.cmd(local, args, opts)
+          {"adb", ["-s", "serial-a", "push" | _rest]} -> {"injected push failure", 1}
+          {"adb", _args} -> {"", 0}
+        end
+      end
+
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+      cleanup = fn plan -> cleanup_authoritative_android_plan(plan) end
+
+      assert {:error, {:partial_update, reason},
+              %{state: :retained_failure, phase: :acquired, serials: ["serial-a", "serial-b"]}} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 otp_runner,
+                 preinstall,
+                 cleanup
+               )
+
+      assert reason =~ "push OTP archive failed"
+      probe_commands = drain_native_commands(:native_probe)
+      otp_commands = drain_native_commands(:native_otp)
+      assert Enum.count(probe_commands, &native_install_command?/1) == 1
+
+      assert Enum.count(otp_commands, fn
+               {"adb", ["-s", "serial-a", "push" | _args]} -> true
+               _command -> false
+             end) == 1
+
+      refute Enum.any?(otp_commands, fn
+               {"adb", ["-s", "serial-a", "shell" | _args]} -> true
+               _command -> false
+             end)
+
+      refute Enum.any?(probe_commands, fn
+               {"adb", ["-s", "serial-b", "install" | _args]} -> true
+               _command -> false
+             end)
+    end
+
+    test "native-ready commit failure after APK and OTP success remains an explicit partial update",
+         %{tmp_dir: dir} do
+      fixture = authoritative_android_fixture!(dir, ["serial-a"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      base_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+
+      probe_runner = fn executable, args ->
+        case {executable, args} do
+          {"adb", ["-s", "serial-a", "shell", command]} ->
+            if String.contains?(command, "native_ready") do
+              send(self(), {:native_probe, executable, args})
+              {"", 1}
+            else
+              base_runner.(executable, args)
+            end
+
+          _command ->
+            base_runner.(executable, args)
+        end
+      end
+
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+      cleanup = fn plan -> cleanup_authoritative_android_plan(plan) end
+
+      assert {:error, {:partial_update, reason},
+              %{state: :retained_ambiguous, phase: :acquired, serials: ["serial-a"]}} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 authoritative_android_otp_runner(self()),
+                 preinstall,
+                 cleanup
+               )
+
+      assert reason =~ "native-ready commit failed"
+      assert Enum.count(drain_native_commands(:native_probe), &native_install_command?/1) == 1
+    end
+
+    test "runner exceptions after acquire preserve the exact ambiguous lease and stop later targets",
+         %{tmp_dir: dir} do
+      fixture = authoritative_android_fixture!(dir, ["serial-a", "serial-b"])
+      owner_state = start_supervised!({Agent, fn -> true end})
+      probe_runner = authoritative_android_probe_runner(self(), fixture, owner_state)
+
+      otp_runner =
+        authoritative_android_otp_runner(self(), fn
+          ["-s", "serial-a", "push" | _args] -> throw(:transport_lost_after_write)
+          _args -> :ok
+        end)
+
+      preinstall = fn input -> {:ok, authoritative_android_payload_plan!(dir, input)} end
+
+      cleanup = fn plan ->
+        send(self(), {:payload_cleanup, plan.attempt_id})
+        {:error, :injected_cleanup_failure}
+      end
+
+      assert {:error,
+              {:partial_update,
+               "Android device transaction became ambiguous after APK update; deploy lease retained"},
+              %{
+                owner: "ownerproof000001",
+                state: :retained_ambiguous,
+                phase: :acquired,
+                serials: ["serial-a", "serial-b"]
+              }} =
+               run_authoritative_android(
+                 fixture,
+                 dir,
+                 probe_runner,
+                 otp_runner,
+                 preinstall,
+                 cleanup
+               )
+
+      assert_received {:payload_cleanup, "planbeam00000001"}
+      refute_received {:payload_cleanup, "planbeam00000001"}
+      probe_commands = drain_native_commands(:native_probe)
+
+      assert Enum.count(probe_commands, &native_install_command?/1) == 1
+
+      refute Enum.any?(probe_commands, fn
+               {"adb", ["-s", "serial-b", "install" | _args]} -> true
+               _command -> false
+             end)
+
+      Enum.each(Path.wildcard(Path.join(dir, "authoritative-plan-*.apk")), &File.rm!/1)
+      Enum.each(Path.wildcard(Path.join(dir, "authoritative-beams-*.tar")), &File.rm!/1)
+    end
+  end
+
+  defp authoritative_android_fixture!(dir, serials) do
+    package = "com.example.casein"
+    elixir_lib = Path.join(dir, "authoritative-elixir")
+
+    for app <- ["elixir", "logger", "eex"] do
+      ebin = Path.join([elixir_lib, app, "ebin"])
+      File.mkdir_p!(ebin)
+      File.write!(Path.join(ebin, "#{app}.beam"), "#{app}-runtime")
+    end
+
+    File.write!(Path.join([elixir_lib, "elixir", "ebin", "Elixir.Kernel.beam"]), "kernel")
+
+    otp_by_abi =
+      Map.new(["arm64-v8a", "armeabi-v7a", "x86_64"], fn abi ->
+        otp_dir = Path.join(dir, "authoritative-otp-#{abi}")
+        erts_bin = Path.join(otp_dir, "erts-17.0/bin")
+        File.mkdir_p!(erts_bin)
+
+        for helper <- ["erl_child_setup", "inet_gethost", "epmd"] do
+          File.write!(Path.join(erts_bin, helper), "#{abi}:#{helper}")
+        end
+
+        {abi, otp_dir}
+      end)
+
+    apk = Path.join(dir, "authoritative-input.apk")
+
+    apk_entries =
+      for {abi, otp_dir} <- otp_by_abi,
+          {helper, packaged} <- [
+            {"erl_child_setup", "liberl_child_setup.so"},
+            {"inet_gethost", "libinet_gethost.so"},
+            {"epmd", "libepmd.so"}
+          ] do
+        source = Path.join([otp_dir, "erts-17.0", "bin", helper])
+        {String.to_charlist("lib/#{abi}/#{packaged}"), File.read!(source)}
+      end
+
+    {:ok, _apk} = :zip.create(String.to_charlist(apk), apk_entries)
+
+    %{
+      apk: apk,
+      package: package,
+      serials: serials,
+      elixir_lib: elixir_lib,
+      otp_arm64: Map.fetch!(otp_by_abi, "arm64-v8a"),
+      otp_arm32: Map.fetch!(otp_by_abi, "armeabi-v7a"),
+      otp_x86_64: Map.fetch!(otp_by_abi, "x86_64")
+    }
+  end
+
+  defp authoritative_android_payload_plan!(dir, input) do
+    unique = System.unique_integer([:positive, :monotonic])
+    apk = Path.join(dir, "authoritative-plan-#{unique}.apk")
+    beam_archive = Path.join(dir, "authoritative-beams-#{unique}.tar")
+    File.cp!(input.apk, apk)
+    File.write!(beam_archive, "exact prepared BEAM archive")
+    File.chmod!(apk, 0o400)
+    File.chmod!(beam_archive, 0o400)
+
+    {MobDev.NativeBuild, beam_binary, _beam_path} = :code.get_object_code(MobDev.NativeBuild)
+
+    beam_path = "Elixir.MobDev.NativeBuild.beam"
+    attempt_id = "planbeam00000001"
+    app_data = "/data/data/#{input.bundle_id}/files"
+
+    restart_by_serial =
+      input.serials
+      |> Enum.with_index(9_100)
+      |> Map.new(fn {serial, dist_port} ->
+        suffix = String.replace(serial, ~r/[^A-Za-z0-9_]/, "_")
+
+        {serial,
+         %{
+           package: input.bundle_id,
+           activity: ".MainActivity",
+           restart?: true,
+           mode: :checked_restart,
+           dist_port: dist_port,
+           node_suffix: suffix
+         }}
+      end)
+
+    %{
+      version: 1,
+      package: input.bundle_id,
+      attempt_id: attempt_id,
+      serials: input.serials,
+      selected_abis: input.selected_abis,
+      selected_abis_by_serial: input.selected_abis_by_serial,
+      apk: authoritative_android_file_identity!(apk),
+      beam: %{
+        archive: authoritative_android_file_identity!(beam_archive),
+        stage_device: "/data/local/tmp/mob_beams_#{attempt_id}.tar",
+        app_stage: "#{app_data}/.mob_beams_stage_#{attempt_id}",
+        app_backup: "#{app_data}/.mob_beams_backup_#{attempt_id}",
+        activation_lock: "#{app_data}/.mob_beams_activation_lock",
+        dist_snapshot: [
+          %{
+            module: MobDev.NativeBuild,
+            path: beam_path,
+            binary: beam_binary,
+            sha256: :crypto.hash(:sha256, beam_binary)
+          }
+        ],
+        runtime_version: System.version(),
+        beam_flags: nil
+      },
+      exqlite: nil,
+      restart_by_serial: restart_by_serial
+    }
+  end
+
+  defp authoritative_android_file_identity!(path) do
+    bytes = File.read!(path)
+
+    %{
+      path: path,
+      size: byte_size(bytes),
+      sha256: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    }
+  end
+
+  defp cleanup_authoritative_android_plan(plan) do
+    File.rm(plan.apk.path)
+    File.rm(plan.beam.archive.path)
+
+    if is_map(plan.exqlite) do
+      File.rm(plan.exqlite.archive.path)
+    end
+
+    :ok
+  end
+
+  defp run_authoritative_android(
+         fixture,
+         dir,
+         probe_runner,
+         otp_runner,
+         preinstall,
+         cleanup,
+         extra_opts \\ []
+       ) do
+    opts =
+      [
+        probe_runner: probe_runner,
+        manifest_runner: fn "apkanalyzer", ["manifest", "application-id", _apk] ->
+          {fixture.package <> "\n", 0}
+        end,
+        otp_runner: otp_runner,
+        android_preinstall: preinstall,
+        android_preinstall_cleanup: cleanup,
+        tmp_root: dir,
+        attempt_id: "nativeotp0000001",
+        lock_owner: "ownerproof000001"
+      ]
+      |> Keyword.merge(extra_opts)
+
+    NativeBuild.install_and_deliver_android_runtime(
+      fixture.apk,
+      fixture.serials,
+      fixture.package,
+      fixture.elixir_lib,
+      fixture.otp_arm64,
+      fixture.otp_arm32,
+      fixture.otp_x86_64,
+      opts
+    )
+  end
+
+  defp authoritative_android_probe_runner(owner, fixture, owner_state) do
+    serials = Enum.sort(fixture.serials)
+    digest = :crypto.hash(:sha256, Enum.join(serials, <<0>>)) |> Base.encode16(case: :lower)
+    record = "1|ownerproof000001|#{digest}|acquired"
+
+    fn "adb", args ->
+      send(owner, {:native_probe, "adb", args})
+
+      case args do
+        ["-s", _serial, "shell", "pm", "list", "packages", package]
+        when package == fixture.package ->
+          {"package:#{fixture.package}\n", 0}
+
+        ["-s", _serial, "shell", "getprop", "ro.product.cpu.abi"] ->
+          {"arm64-v8a\n", 0}
+
+        ["-s", _serial, "install", "-r", _apk] ->
+          {"Success\n", 0}
+
+        ["-s", _serial, "root"] ->
+          {"adbd cannot run as root in production builds", 1}
+
+        ["-s", _serial, "shell", command] ->
+          if String.contains?(command, "size=$(wc -c") and
+               not String.contains?(command, "value=$(cat") do
+            if Agent.get(owner_state, & &1), do: {record, 0}, else: {"replaced", 0}
+          else
+            {"", 0}
+          end
+      end
+    end
+  end
+
+  defp authoritative_android_otp_runner(owner, hook \\ fn _args -> :ok end) do
+    fn executable, args, opts ->
+      send(owner, {:native_otp, executable, args})
+
+      cond do
+        executable in ["cp", "tar"] ->
+          System.cmd(executable, args, opts)
+
+        executable == "adb" ->
+          hook.(args)
+          {"", 0}
+      end
+    end
+  end
+
+  defp drain_native_commands(tag, commands \\ []) do
+    receive do
+      {^tag, executable, args} -> drain_native_commands(tag, [{executable, args} | commands])
+    after
+      0 -> Enum.reverse(commands)
+    end
+  end
+
+  defp native_install_command?({"adb", ["-s", _serial, "install", "-r", _apk]}), do: true
+  defp native_install_command?(_command), do: false
+
+  defp native_lock_mutation_command?({"adb", ["-s", _serial, "shell", command]}) do
+    String.contains?(command, ".mob_native_deploy_lock") and
+      (String.contains?(command, "mkdir ") or String.contains?(command, "printf %s"))
+  end
+
+  defp native_lock_mutation_command?(_command), do: false
+
+  describe "deprecated push_otp_runas/6" do
+    test "fails before invoking an injected command runner" do
+      runner = fn executable, args, _opts ->
+        send(self(), {:command, executable, args})
+        {"unexpected", 0}
+      end
+
+      assert %{
+               ok?: true,
+               android_device_disposition: :artifact_only,
+               android_deploy_lock: nil,
+               android_payload_plan: nil
+             } = NativeBuild.build_outcome([{:ok, "Android"}])
+
+      assert {:error, reason} =
+               apply(NativeBuild, :push_otp_runas, [
+                 "serial-a",
+                 "com.example.casein",
+                 "/data/data/com.example.casein/files",
+                 "/tmp/otp",
+                 "/tmp/elixir",
+                 [runner: runner]
+               ])
+
+      assert reason =~ "authoritative payload transaction"
+      refute_received {:command, _, _}
+    end
+  end
+
+  defp native_ready_lease(serials) do
+    serials = Enum.sort(serials)
+
+    %{
+      bundle_id: "com.example.casein",
+      owner: "ownerproof000001",
+      serials: serials,
+      target_digest:
+        serials
+        |> Enum.join(<<0>>)
+        |> then(&:crypto.hash(:sha256, &1))
+        |> Base.encode16(case: :lower),
+      phase: :native_ready,
+      state: :held_success
+    }
   end
 end

@@ -21,9 +21,11 @@ end
 | Task | Description |
 |------|-------------|
 | `mix mob.new APP_NAME` | Generate a new Mob project (see `mob_new` archive) |
+| `mix mob.adopt` | Install Mob into an **existing** Phoenix project (Igniter-based; composes `mob.adopt.{deps,bridge,screen,mob_app,mob_exs,native,finalize}`). The install-into-existing counterpart to `mix mob.new` |
 | `mix mob.install` | First-run setup: download OTP runtime, generate icons, write `mob.exs` |
 | `mix mob.deploy` | Compile and push BEAMs to all connected devices |
 | `mix mob.deploy --native` | Also build and install the native APK/iOS app |
+| `mix mob.deploy_lock --device ID` | Inspect one exact Android deploy lease; optionally clean only a verified committed tombstone |
 | `mix mob.deploy --slim` | Same, but with the App Store strip pass applied (slow, lets you verify a slim build before TestFlight — see [`guides/slim_release.md`](guides/slim_release.md)) |
 | `mix mob.release` | Build a signed `.ipa` / `.aab` for App Store / TestFlight / Play Store (slim by default) |
 | `mix mob.release --security-gate` | Same, but runs `mix mob.security_scan` first and aborts on any critical/high/medium finding ([details](guides/security_scan.md)) |
@@ -88,9 +90,50 @@ Pushing 14 BEAM file(s) to 2 device(s)...
   iPhone 15 Pro   →  pushing... ✓ (dist, no restart)
 ```
 
-If dist is not reachable (first deploy, app not running), it falls back to `adb push` + restart. Mixed deploys work — one device can hot-push while another restarts.
+If every frozen Android target is already reachable over distribution, the
+whole exact set hot-pushes. Otherwise the whole Android set uses the fenced
+`adb push` + restart path; Mob never splits one Android transaction across two
+authorities. A mixed iOS/Android command handles each platform in its own
+ordered, committed phase.
 
 **Requirements:** The app must call `Mob.Dist.ensure_started/1` at startup, and the cookie must match the one in `mob.exs` (default `:mob_secret`).
+
+### Android native updates preserve app data
+
+`mix mob.deploy --native --android` is deliberately update-only. Every selected
+device must already contain the configured package, and Mob uses only the
+serial-scoped equivalent of `adb install -r`. It never clears app data,
+uninstalls the package, or turns a rejected update into a fresh install.
+
+Before the first device write, Mob snapshots and verifies the exact APK, OTP,
+BEAM, `priv`, and optional exqlite payloads. A phase-bound lease covers the
+sorted canonical device set so a concurrent deploy or hot push cannot change a
+subset mid-transaction. The lease advances only after the native payload and
+then the final authoritative BEAM/restart pass have each completed on every
+target. Replayed, widened, stale, or wrong-phase work fails closed.
+
+For a mixed Android+iOS native command, Android is deliberately serialized
+first: it must commit, release its exact-set lease, and clean its immutable
+staging before iOS build/install begins. A typed result that proves Android was
+not attempted may continue to iOS; every failed, retained, malformed, or
+ambiguous Android result suppresses iOS. Fast Android BEAM deploys are also
+exact-set transactions.
+
+If transport authority becomes ambiguous after a write, Mob intentionally
+retains the device-side lease or release tombstone and stops later targets. Do
+not recover by uninstalling the app or deleting its data. Inspect the bounded
+lease status, resolve the interrupted operation, and remove only a verified
+committed release tombstone; an active or malformed lease requires manual
+diagnosis.
+
+```sh
+mix mob.deploy_lock --device <exact-adb-serial>
+mix mob.deploy_lock --device <exact-adb-serial> --cleanup-committed
+```
+
+The first command is read-only. The second refuses every state except one exact,
+record-only tombstone that already carries a committed phase, and proves the
+device returned to a clear state after the single cleanup attempt.
 
 ## `mix mob.enable <feature>`
 
@@ -801,3 +844,15 @@ Mob.Test.assigns(node)              # verify photo_path was stored
 ```
 
 If you need to see the rendered UI, take a screenshot with the native MCP tool, then use `Mob.Test.find/2` to correlate what you see with the component tree.
+
+## Development
+
+Clone, then run once:
+
+```bash
+mix setup
+```
+
+That fetches deps and activates the repo's git hooks (`.githooks/pre-push`):
+`mix format --check`, `mix credo --strict` (incl. ExSlop), and `mix compile --warnings-as-errors` run on every push, plus the full test
+suite when `mix.exs` changes — the same gate CI enforces before publishing.

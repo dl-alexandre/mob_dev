@@ -1,5 +1,56 @@
 defmodule MobDev.NativeBuild do
-  alias MobDev.Release
+  alias MobDev.{AndroidDeployLock, AndroidDeployRecoveryProof, Release}
+
+  @max_android_update_targets 32
+  @max_adb_serial_bytes 128
+  @max_adb_discovery_bytes 8_192
+  @max_adb_install_result_bytes 4_096
+  @max_android_apk_bytes 1_073_741_824
+  @max_android_apk_entries 100_000
+  @max_android_apk_entry_bytes 1_024
+  @max_android_apk_required_entry_bytes 268_435_456
+  @android_attempt_id_pattern "\\A[A-Za-z0-9_-]{16}\\z"
+  @android_erts_sentinel_pattern "\\Aerts-[A-Za-z0-9._-]+/bin/erl_child_setup\\z"
+  @android_erts_helpers [
+    {"erl_child_setup", "liberl_child_setup.so"},
+    {"inet_gethost", "libinet_gethost.so"},
+    {"epmd", "libepmd.so"}
+  ]
+
+  @type android_update_failure_reason ::
+          :insufficient_storage
+          | :signature_mismatch
+          | :version_downgrade
+          | :offline
+          | :unauthorized
+          | :unavailable
+          | :install_rejected
+          | :suspicious_success
+          | :unknown_failure
+          | :invalid_target
+
+  @type android_update_failure :: %{
+          required(:serial) => String.t(),
+          required(:reason) => android_update_failure_reason()
+        }
+
+  @type android_update_outcome :: %{
+          required(:succeeded) => [String.t()],
+          required(:failed) => [android_update_failure()]
+        }
+
+  @type build_outcome :: %{
+          required(:ok?) => boolean(),
+          required(:android_device_disposition) =>
+            :not_attempted | :artifact_only | :held | :failed | :retained | :partial_update,
+          required(:android_serials) => [String.t()],
+          required(:android_deploy_lock) => map() | nil,
+          required(:android_payload_plan) => map() | nil
+        }
+
+  @type command_runner :: (String.t(), [String.t()] -> {String.t(), integer()})
+  @type command_runner_with_opts ::
+          (String.t(), [String.t()], keyword() -> {String.t(), integer()})
 
   @moduledoc """
   Builds native binaries (APK for Android, .app bundle for iOS simulator)
@@ -15,6 +66,8 @@ defmodule MobDev.NativeBuild do
 
     * `:mob_dir`           — mob library repo (native C/ObjC/Swift source)
     * `:elixir_lib`        — Elixir stdlib lib dir
+    * `:project_swift_sources` — optional extra Swift sources compiled into
+                             the iOS app module
   """
 
   @doc """
@@ -25,14 +78,52 @@ defmodule MobDev.NativeBuild do
   `ios/build.zig` exists. Selection between sim and device is driven
   by the `device:` opt.
   """
-  @spec build_all(keyword()) :: [:ok | {:error, term()}]
+  @spec build_all(keyword()) :: boolean()
   def build_all(opts \\ []) do
+    opts
+    |> Keyword.put(:android_device_phase, false)
+    |> build_all_with_outcome()
+    |> Map.fetch!(:ok?)
+  end
+
+  @doc false
+  @spec build_all_with_outcome(keyword()) :: build_outcome()
+  def build_all_with_outcome(opts \\ []) do
     cfg = load_config()
     platforms = Keyword.get(opts, :platforms, [:android, :ios])
     device_id = Keyword.get(opts, :device, nil)
     slim = Keyword.get(opts, :slim, true)
     platforms = narrow_platforms_for_device(platforms, device_id)
     Process.put(:mob_slim, slim)
+
+    # Always regenerate the runtime plugin manifest from the CURRENT activated
+    # plugins before bundling priv — like the driver_tab, it's derived state, not
+    # a hand-maintained file. Regenerating on every build (not just when the
+    # `:plugins` list changes) means adding/changing a plugin's tier-3/4 sections
+    # can't silently ship a stale manifest (the lifecycle/settings/notification
+    # handlers just wouldn't activate on device, with no error).
+    regen_runtime_manifest!()
+
+    # Same treatment for the static-NIF driver table: it's derived state
+    # (mob.exs :static_nifs + the activated plugins' NIFs), but it used to be a
+    # checked-in artifact only `mix mob.regen_driver_tab` refreshed. Activating
+    # a NIF plugin against a stale table links the <module>_nif_init symbol but
+    # never registers it — every call then raises :nif_not_loaded at runtime
+    # with nothing pointing at the cause. Regenerate on every native build.
+    regen_driver_tab!()
+
+    # Tier-3 build-time file merges (platform-agnostic; run once before the
+    # per-platform builds): copy plugin migrations into the host migrations dir
+    # and plugin images into the host bundle assets. Fonts are merged per-platform
+    # (iOS Info.plist + bundle, Android assets) inside the build chains.
+    apply_plugin_migrations!()
+    apply_plugin_images!()
+
+    # Manual host-app obligations a plugin declared (e.g. an AndroidManifest
+    # <service> fragment the plugin system can't contribute) — print every
+    # build, because forgetting one builds + boots clean and only fails at
+    # first feature use (a SecurityException with nothing pointing here).
+    warn_host_requirements!()
 
     results = []
 
@@ -54,39 +145,32 @@ defmodule MobDev.NativeBuild do
           results
 
         true ->
-          [build_android(cfg, device_id) | results]
+          [build_android(cfg, device_id, opts) | results]
       end
 
+    try do
+      finish_native_builds(results, cfg, platforms, device_id, opts)
+    catch
+      _kind, _reason ->
+        IO.puts(
+          "  #{IO.ANSI.red()}✗ native build failed unexpectedly; retained Android deploy state remains authoritative#{IO.ANSI.reset()}"
+        )
+
+        build_outcome([{:error, "Native", "unexpected native build failure"} | results], opts)
+    end
+  end
+
+  defp finish_native_builds(results, cfg, platforms, device_id, opts) do
     results =
-      if :ios in platforms do
-        physical_udid =
-          cond do
-            is_binary(device_id) and ios_physical_udid?(device_id) ->
-              device_id
-
-            is_nil(device_id) ->
-              auto_detect_physical_ios()
-
-            true ->
-              nil
-          end
-
-        cond do
-          not ios_toolchain_available?() ->
-            warn_skipped_ios()
-            results
-
-          physical_udid ->
-            [build_ios_physical(cfg, physical_udid) | results]
-
-          File.exists?("ios/build.zig") ->
-            [build_ios(cfg, device_id) | results]
-
-          true ->
-            results
-        end
-      else
-        results
+      case ios_phase_decision(
+             results,
+             platforms,
+             Keyword.get(opts, :android_device_phase, false)
+           ) do
+        :run -> finish_ios_native_build(results, cfg, device_id)
+        :defer -> results
+        :suppress -> results
+        :skip -> results
       end
 
     if results == [] do
@@ -99,46 +183,329 @@ defmodule MobDev.NativeBuild do
       {:ok, platform} ->
         IO.puts("  #{IO.ANSI.green()}✓ #{platform} native build complete#{IO.ANSI.reset()}")
 
+      {:ok, platform, _metadata} ->
+        IO.puts("  #{IO.ANSI.green()}✓ #{platform} native build complete#{IO.ANSI.reset()}")
+
       {:error, platform, reason} ->
         IO.puts(
           "  #{IO.ANSI.red()}✗ #{platform} native build failed: #{reason}#{IO.ANSI.reset()}"
         )
+
+      {:error, platform, reason, _retained_lock} ->
+        IO.puts(
+          "  #{IO.ANSI.red()}✗ #{platform} native build failed: #{reason} (deploy lock retained)#{IO.ANSI.reset()}"
+        )
+
+      {:error, platform, reason, _retained_lock, :partial_update} ->
+        IO.puts(
+          "  #{IO.ANSI.red()}✗ #{platform} native update partially applied: #{reason} (deploy lock retained)#{IO.ANSI.reset()}"
+        )
     end)
 
-    ok_count = Enum.count(results, &match?({:ok, _}, &1))
-    ok_count == length(results)
+    build_outcome(results, opts)
+  end
+
+  @doc false
+  @spec ios_phase_decision([tuple()], [atom()], term()) :: :run | :defer | :suppress | :skip
+  def ios_phase_decision(results, platforms, android_device_phase)
+      when is_list(results) and is_list(platforms) do
+    cond do
+      :ios not in platforms ->
+        :skip
+
+      android_device_phase != true ->
+        :run
+
+      true ->
+        case Enum.filter(results, &android_build_result?/1) do
+          [] -> :run
+          [result] -> if held_android_device_phase?(result), do: :defer, else: :suppress
+          _multiple -> :suppress
+        end
+    end
+  end
+
+  def ios_phase_decision(_results, _platforms, _android_device_phase), do: :suppress
+
+  defp android_build_result?(result) when is_tuple(result) and tuple_size(result) >= 2,
+    do: elem(result, 1) == "Android"
+
+  defp android_build_result?(_result), do: false
+
+  defp held_android_device_phase?({:ok, "Android", %{serials: serials, deploy_lock: lock}})
+       when is_list(serials) and serials != [] and is_map(lock) do
+    serials == Enum.sort(serials) and Enum.uniq(serials) == serials and
+      MobDev.AndroidDeployLock.valid?(lock, :native_ready) and lock.serials == serials
+  end
+
+  defp held_android_device_phase?(_result), do: false
+
+  defp finish_ios_native_build(results, cfg, device_id) do
+    physical_udid =
+      cond do
+        is_binary(device_id) and ios_physical_udid?(device_id) -> device_id
+        is_nil(device_id) -> auto_detect_physical_ios()
+        true -> nil
+      end
+
+    cond do
+      not ios_toolchain_available?() ->
+        warn_skipped_ios()
+        results
+
+      physical_udid ->
+        [build_ios_physical(cfg, physical_udid) | results]
+
+      File.exists?("ios/build.zig") ->
+        [build_ios(cfg, device_id) | results]
+
+      true ->
+        results
+    end
+  end
+
+  @doc false
+  @spec build_outcome([tuple()]) :: build_outcome()
+  def build_outcome(results) when is_list(results) do
+    ok? = not Enum.empty?(results) and Enum.all?(results, &successful_native_build?/1)
+
+    %{
+      ok?: ok?,
+      android_device_disposition: android_device_disposition(results),
+      android_serials: android_serials_from_results(results),
+      android_deploy_lock: android_deploy_lock_from_results(results),
+      android_payload_plan: if(ok?, do: android_payload_plan_from_results(results), else: nil)
+    }
+  end
+
+  @doc false
+  @spec build_outcome([tuple()], keyword()) :: build_outcome()
+  def build_outcome(results, opts) when is_list(results) and is_list(opts) do
+    outcome = build_outcome(results)
+
+    if outcome.ok? do
+      outcome
+    else
+      case cleanup_successful_android_payloads(results, opts) do
+        :ok ->
+          outcome
+
+        {:error, _cleanup_reason} ->
+          IO.puts(
+            "  #{IO.ANSI.yellow()}⚠ Android payload cleanup failed; deploy lease identity retained#{IO.ANSI.reset()}"
+          )
+
+          outcome
+      end
+    end
   end
 
   # ── Android ──────────────────────────────────────────────────────────────────
 
-  defp build_android(cfg, device_id) do
-    IO.puts("  Building Android APK...")
+  defp build_android(cfg, device_id, opts) do
     bundle_id = cfg[:bundle_id] || MobDev.Config.bundle_id()
     apk = "android/app/build/outputs/apk/debug/app-debug.apk"
     mob_dir = Path.expand(cfg[:mob_dir])
 
-    with {:ok, otp_arm64} <- MobDev.OtpDownloader.ensure_android("arm64-v8a"),
+    with {:ok, update_targets} <- android_update_targets_for_phase(device_id, opts),
+         :ok <- print_android_build_start(),
+         {:ok, otp_arm64} <- MobDev.OtpDownloader.ensure_android("arm64-v8a"),
          {:ok, otp_arm32} <- MobDev.OtpDownloader.ensure_android("armeabi-v7a"),
+         {:ok, otp_x86_64} <- MobDev.OtpDownloader.ensure_android("x86_64"),
          {:ok, python_android_bundle} <- maybe_ensure_python_android_bundle(),
          :ok <- ensure_jni_libs(otp_arm64, "arm64-v8a"),
          :ok <- ensure_jni_libs(otp_arm32, "armeabi-v7a"),
+         :ok <- ensure_jni_libs(otp_x86_64, "x86_64"),
          :ok <- ensure_python_android_libs(python_android_bundle),
          :ok <- install_nx_eigen_otp_lib(otp_arm64),
          :ok <- install_nx_eigen_otp_lib(otp_arm32),
-         :ok <- zig_build_android_objects(mob_dir, otp_arm64, otp_arm32),
+         :ok <- zig_build_android_objects(mob_dir, otp_arm64, otp_arm32, otp_x86_64),
+         :ok <- apply_plugin_android_manifest!(),
+         :ok <- apply_plugin_gradle_deps!(),
+         :ok <- apply_plugin_android_kotlin!(),
+         :ok <- apply_plugin_android_res!(),
+         :ok <- apply_fonts_to_android!(),
          :ok <- gradle_assemble(),
-         :ok <- adb_install_all(apk, bundle_id, device_id),
-         :ok <-
-           push_otp_release_android(
+         {:ok, metadata} <-
+           maybe_install_android_runtime(
+             apk,
+             update_targets,
              bundle_id,
              cfg[:elixir_lib],
              otp_arm64,
              otp_arm32,
-             device_id
+             otp_x86_64,
+             opts
            ) do
-      {:ok, "Android"}
+      {:ok, "Android", Map.put(metadata, :serials, update_targets)}
     else
-      {:error, reason} -> {:error, "Android", reason}
+      {:error, {:partial_update, reason}, deploy_lock} ->
+        {:error, "Android", reason, deploy_lock, :partial_update}
+
+      {:error, reason, deploy_lock} ->
+        {:error, "Android", reason, deploy_lock}
+
+      {:error, reason} ->
+        {:error, "Android", reason}
+    end
+  end
+
+  defp android_update_targets_for_phase(device_id, opts) do
+    case Keyword.get(opts, :android_device_phase, false) do
+      false -> {:ok, []}
+      true -> android_update_targets(device_id)
+      _invalid -> {:error, "Invalid Android device-phase option"}
+    end
+  end
+
+  defp maybe_install_android_runtime(
+         _apk,
+         [],
+         _bundle_id,
+         _elixir_lib,
+         _otp_arm64,
+         _otp_arm32,
+         _otp_x86_64,
+         opts
+       ) do
+    case Keyword.get(opts, :android_device_phase, false) do
+      false -> {:ok, %{deploy_lock: nil, payload_plan: nil}}
+      _device_phase -> {:error, "Android device phase requires explicit canonical targets"}
+    end
+  end
+
+  defp maybe_install_android_runtime(
+         apk,
+         update_targets,
+         bundle_id,
+         elixir_lib,
+         otp_arm64,
+         otp_arm32,
+         otp_x86_64,
+         opts
+       ) do
+    install_and_deliver_android_runtime(
+      apk,
+      update_targets,
+      bundle_id,
+      elixir_lib,
+      otp_arm64,
+      otp_arm32,
+      otp_x86_64,
+      opts
+    )
+  end
+
+  defp print_android_build_start do
+    IO.puts("  Building Android APK...")
+    :ok
+  end
+
+  defp successful_native_build?({:ok, _platform}), do: true
+  defp successful_native_build?({:ok, _platform, _metadata}), do: true
+  defp successful_native_build?(_result), do: false
+
+  defp android_device_disposition(results) do
+    case Enum.filter(results, &android_build_result?/1) do
+      [] ->
+        :not_attempted
+
+      [result] ->
+        classify_android_device_result(result)
+
+      multiple ->
+        cond do
+          Enum.any?(multiple, &partial_android_update?/1) -> :partial_update
+          Enum.any?(multiple, &android_authority_present?/1) -> :retained
+          true -> :failed
+        end
+    end
+  end
+
+  defp classify_android_device_result({:error, "Android", _reason, lock, :partial_update})
+       when is_map(lock),
+       do: :partial_update
+
+  defp classify_android_device_result({:error, "Android", _reason, lock}) when is_map(lock),
+    do: :retained
+
+  defp classify_android_device_result(result) do
+    cond do
+      held_android_device_phase?(result) -> :held
+      artifact_only_android_result?(result) -> :artifact_only
+      true -> :failed
+    end
+  end
+
+  defp artifact_only_android_result?({:ok, "Android"}), do: true
+
+  defp artifact_only_android_result?(
+         {:ok, "Android", %{serials: [], deploy_lock: nil, payload_plan: nil}}
+       ),
+       do: true
+
+  defp artifact_only_android_result?(_result), do: false
+
+  defp partial_android_update?({:error, "Android", _reason, lock, :partial_update})
+       when is_map(lock),
+       do: true
+
+  defp partial_android_update?(_result), do: false
+
+  defp android_authority_present?({:error, "Android", _reason, lock, :partial_update})
+       when is_map(lock),
+       do: true
+
+  defp android_authority_present?({:error, "Android", _reason, lock}) when is_map(lock),
+    do: true
+
+  defp android_authority_present?({:ok, "Android", %{deploy_lock: lock}}) when is_map(lock),
+    do: true
+
+  defp android_authority_present?(_result), do: false
+
+  defp android_serials_from_results(results) do
+    Enum.find_value(results, [], fn
+      {:ok, "Android", %{serials: serials, deploy_lock: %{}}} -> serials
+      {:error, "Android", _reason, %{serials: serials}, :partial_update} -> serials
+      _build_only_or_absent -> nil
+    end)
+  end
+
+  defp android_deploy_lock_from_results(results) do
+    Enum.find_value(results, fn
+      {:ok, "Android", %{deploy_lock: lock}} -> lock
+      {:error, "Android", _reason, lock, :partial_update} -> lock
+      {:error, "Android", _reason, lock} -> lock
+      _result -> nil
+    end)
+  end
+
+  defp android_payload_plan_from_results(results) do
+    Enum.find_value(results, fn
+      {:ok, "Android", %{payload_plan: plan}} -> plan
+      _result -> nil
+    end)
+  end
+
+  defp cleanup_successful_android_payloads(results, opts) do
+    case Keyword.get(opts, :android_preinstall_cleanup) do
+      cleanup when is_function(cleanup, 1) ->
+        results
+        |> Enum.flat_map(fn
+          {:ok, "Android", %{payload_plan: plan}} when is_map(plan) -> [plan]
+          _result -> []
+        end)
+        |> Enum.uniq()
+        |> Enum.reduce_while(:ok, fn plan, :ok ->
+          case cleanup_android_payload(cleanup, plan) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+
+      _missing ->
+        :ok
     end
   end
 
@@ -150,21 +517,28 @@ defmodule MobDev.NativeBuild do
   # Skips silently if the project has no jni/build.zig (older projects from
   # before this iter still work via CMake compiling driver_tab_android.c
   # directly through the Phase 0 fallback).
-  defp zig_build_android_objects(mob_dir, otp_arm64, otp_arm32) do
+  defp zig_build_android_objects(mob_dir, otp_arm64, otp_arm32, otp_x86_64) do
     build_zig = "android/app/src/main/jni/build.zig"
+    # The CMake fallback (used when zig can't run) tries to compile this C
+    # source straight out of the mob dep. mob 0.7+ ships it as .zig instead,
+    # so on a current mob the fallback is a dead end; see zig_build_plan/3.
+    legacy_c = Path.join(mob_dir, "android/jni/mob_nif.c")
 
-    cond do
-      not File.exists?(build_zig) ->
+    case zig_build_plan(File.exists?(build_zig), zig_available?(), File.exists?(legacy_c)) do
+      :skip_no_build_zig ->
         :ok
 
-      not zig_available?() ->
+      :legacy_cmake ->
         IO.puts(
           "  #{IO.ANSI.yellow()}zig not on PATH — skipping build.zig step (CMake will compile sources directly)#{IO.ANSI.reset()}"
         )
 
         :ok
 
-      true ->
+      :zig_required ->
+        {:error, zig_required_message()}
+
+      :run_zig ->
         driver_tab = resolve_driver_tab_android(mob_dir)
         erts_vsn = detect_erts_vsn(otp_arm64) || "erts-17.0"
 
@@ -181,31 +555,168 @@ defmodule MobDev.NativeBuild do
         # set and links them into its `lib<app>.so`.
         with {:ok, arm64_nif_args} <- project_nif_zig_args(:android_arm64),
              {:ok, arm32_nif_args} <- project_nif_zig_args(:android_arm32),
+             {:ok, x86_64_nif_args} <- project_nif_zig_args(:android_x86_64),
              {:ok, arm64_nxeigen} <- maybe_build_nxeigen(:android_arm64),
-             {:ok, arm32_nxeigen} <- maybe_build_nxeigen(:android_arm32) do
-          Enum.reduce_while(
-            [
-              {otp_arm64, "arm64-v8a", arm64_nif_args, arm64_nxeigen},
-              {otp_arm32, "armeabi-v7a", arm32_nif_args, arm32_nxeigen}
-            ],
-            :ok,
-            fn {otp_dir, abi, abi_nif_args, abi_nxeigen}, _acc ->
-              case run_zig_android_objects(
-                     build_zig,
-                     abi,
-                     otp_dir,
-                     erts_vsn,
-                     mob_dir,
-                     driver_tab,
-                     abi_nif_args,
-                     abi_nxeigen
-                   ) do
-                :ok -> {:cont, :ok}
-                {:error, reason} -> {:halt, {:error, reason}}
-              end
+             {:ok, arm32_nxeigen} <- maybe_build_nxeigen(:android_arm32),
+             {:ok, arm64_tflite} <- maybe_build_tflite(:android_arm64),
+             {:ok, arm32_tflite} <- maybe_build_tflite(:android_arm32) do
+          build_zig_src =
+            case inject_page_size_flag(File.read!(build_zig)) do
+              {:already, src} ->
+                src
+
+              {:patched, src} ->
+                File.write!(build_zig, src)
+
+                IO.puts(
+                  "  Added 16 KB page-size alignment to #{build_zig} " <>
+                    "(Android 15+ / Play requirement; build.zig predated the flag)."
+                )
+
+                src
+
+              {:no_match, src} ->
+                IO.puts(
+                  "  #{IO.ANSI.yellow()}Could not auto-add the 16 KB page-size flag to " <>
+                    "#{build_zig} — add -Wl,-z,max-page-size=16384 to the -shared link " <>
+                    "manually, or regenerate build.zig from mob_new.#{IO.ANSI.reset()}"
+                )
+
+                src
             end
-          )
+
+          [
+            {otp_arm64, "arm64-v8a", arm64_nif_args, arm64_nxeigen, arm64_tflite},
+            {otp_arm32, "armeabi-v7a", arm32_nif_args, arm32_nxeigen, arm32_tflite},
+            {otp_x86_64, "x86_64", x86_64_nif_args, nil, nil}
+          ]
+          |> Enum.filter(fn {_otp, abi, _nif, _nx, _tf} ->
+            build_zig_supports_abi?(build_zig_src, abi) ||
+              warn_skip_abi(build_zig, abi)
+          end)
+          |> Enum.reduce_while(:ok, fn {otp_dir, abi, abi_nif_args, abi_nxeigen, abi_tflite},
+                                       _acc ->
+            # Drop the TFLite runtime .so into jniLibs/<abi>/ alongside
+            # the static-NIF archive that gets linked into native-lib.
+            # No-op when TFLite isn't enabled.
+            :ok = copy_tflite_runtime_lib_android(abi_tflite, abi)
+
+            case run_zig_android_objects(
+                   build_zig,
+                   abi,
+                   otp_dir,
+                   erts_vsn,
+                   mob_dir,
+                   driver_tab,
+                   abi_nif_args,
+                   abi_nxeigen,
+                   abi_tflite
+                 ) do
+              :ok -> {:cont, :ok}
+              {:error, reason} -> {:halt, {:error, reason}}
+            end
+          end)
         end
+    end
+  end
+
+  # Pure kernel behind zig_build_android_objects/4, extracted so the
+  # "obvious failure" case is testable without a toolchain or a device.
+  # Decides the JNI build step from the three facts that determine whether
+  # a native build can succeed at all:
+  #
+  #   build_zig?  does the project ship jni/build.zig?
+  #   zig?        is `zig` on PATH (so build.zig can actually run)?
+  #   legacy_c?   does the mob dep still ship the C JNI source the CMake
+  #               fallback would compile (android/jni/mob_nif.c)?
+  #
+  # Outcomes:
+  #   :skip_no_build_zig  no build.zig, nothing for this step to do.
+  #   :run_zig            zig present, drive the real build.zig path.
+  #   :legacy_cmake       no zig, but the mob dep still has the C sources,
+  #                       so CMake can compile them directly (old mob).
+  #   :zig_required       no zig AND no C sources (mob 0.7+): the build
+  #                       cannot succeed, so fail fast with a clear cause
+  #                       instead of limping into a cryptic CMake error.
+  @doc false
+  @spec zig_build_plan(boolean(), boolean(), boolean()) ::
+          :skip_no_build_zig | :run_zig | :legacy_cmake | :zig_required
+  def zig_build_plan(build_zig?, zig?, legacy_c?)
+  def zig_build_plan(false, _zig?, _legacy_c?), do: :skip_no_build_zig
+  def zig_build_plan(true, true, _legacy_c?), do: :run_zig
+  def zig_build_plan(true, false, true), do: :legacy_cmake
+  def zig_build_plan(true, false, false), do: :zig_required
+
+  # The actionable error shown when an Android native build needs `zig` but
+  # it is not on PATH and the mob dep no longer ships the C fallback sources.
+  # Public so the test suite can pin the guidance without driving a build.
+  @doc false
+  @spec zig_required_message() :: String.t()
+  def zig_required_message do
+    """
+    zig is not on your PATH, and this project's Android native build needs it.
+
+    mob 0.7+ compiles the Android JNI layer with build.zig. The legacy CMake
+    fallback would reference C sources (deps/mob/android/jni/mob_nif.c) that no
+    longer ship with mob, so the build cannot succeed without zig.
+
+    Install zig 0.15.x, then re-run `mix mob.deploy --native --android`:
+      asdf:    asdf plugin add zig && asdf install zig 0.15.2 && asdf global zig 0.15.2
+      manual:  https://ziglang.org/download/  (then put `zig` on your PATH)
+
+    Verify your toolchain any time with `mix mob.doctor`.\
+    """
+  end
+
+  # True if the app's build.zig handles `abi`. mob_dev builds all of
+  # arm64-v8a/armeabi-v7a/x86_64 by default, but an app's app-owned build.zig
+  # (copied at `mix mob.new` time) may predate x86_64 support (mob_new < 0.4.5)
+  # and reject it, which used to fail the whole native build — aborting before
+  # the plugin-bootstrap regen. Each handled ABI appears as a quoted string
+  # literal in the build.zig's abi_to_target/ndk_arch_triple switches, so check
+  # for that. Safe to skip: gradle abiFilters won't ship an ABI the build.zig
+  # can't compile. Real failures of a SUPPORTED ABI still halt the build.
+  @doc false
+  @spec build_zig_supports_abi?(String.t(), String.t()) :: boolean()
+  def build_zig_supports_abi?(build_zig_src, abi) do
+    String.contains?(build_zig_src, ~s("#{abi}"))
+  end
+
+  defp warn_skip_abi(build_zig, abi) do
+    IO.puts(
+      "  #{IO.ANSI.yellow()}Skipping ABI #{abi}: not handled by #{build_zig} " <>
+        "(regenerate from mob_new >= 0.4.5 to add x86_64).#{IO.ANSI.reset()}"
+    )
+
+    false
+  end
+
+  # The app's `-shared` link command, and that command with the 16 KB page-size
+  # flag added. Android 15+ devices use 16 KB memory pages; Google Play requires
+  # every bundled .so to have 16 KB-aligned LOAD segments. New apps get this from
+  # the mob_new template, but an app-owned build.zig copied at `mix mob.new` time
+  # predates the flag and links 4 KB-aligned .so. The link line is identical
+  # across template versions, so we patch the command-array form (independent of
+  # the `run`/var name and any later addArg lines).
+  @shared_link ", \"-shared\" })"
+  @shared_link_aligned ", \"-shared\", \"-Wl,-z,max-page-size=16384\" })"
+
+  # Ensure the app's build.zig links 16 KB-aligned .so. Returns the (possibly
+  # patched) source plus a status: `:already` (flag present), `:patched` (flag
+  # injected into the -shared link), or `:no_match` (link line not recognized —
+  # can't auto-fix). Pure; the caller writes the file + logs.
+  @doc false
+  @spec inject_page_size_flag(String.t()) :: {:already | :patched | :no_match, String.t()}
+  def inject_page_size_flag(build_zig_src) do
+    cond do
+      String.contains?(build_zig_src, "max-page-size") ->
+        {:already, build_zig_src}
+
+      String.contains?(build_zig_src, @shared_link) ->
+        {:patched, String.replace(build_zig_src, @shared_link, @shared_link_aligned)}
+
+      true ->
+        {:no_match, build_zig_src}
     end
   end
 
@@ -217,13 +728,32 @@ defmodule MobDev.NativeBuild do
          mob_dir,
          driver_tab,
          nif_args,
-         nxeigen_archive
+         nxeigen_archive,
+         tflite_build
        ) do
     app_name = Mix.Project.config() |> Keyword.fetch!(:app) |> Atom.to_string()
     project_root = Path.expand(".")
     project_jni_dir = Path.join(project_root, "android/app/src/main/jni")
     jni_libs_abi = Path.join([project_root, "android/app/src/main/jniLibs", abi])
     File.mkdir_p!(jni_libs_abi)
+
+    # Activated plugins' C NIF sources (one .c per nif, named after the NIF
+    # module). Empty when no NIF-bearing plugin is activated; the build.zig
+    # template orelse's "" so the flag is always safe to emit.
+    plugin_c_nifs =
+      MobDev.Plugin.Merge.nif_sources(MobDev.Plugin.activated(), :android) |> Enum.join(",")
+
+    # Activated plugins' zig NIF sources (one .zig per nif, lang: :zig). Same
+    # shape as plugin_c_nifs but compiled via addZigObject with named-module
+    # imports for mob-core bindings. Empty when no zig-NIF plugin is activated.
+    plugin_zig_nifs =
+      MobDev.Plugin.Merge.zig_nif_sources(MobDev.Plugin.activated(), :android) |> Enum.join(",")
+
+    # Activated plugins' JNI-thunk C sources (android.jni_source). Plain C
+    # objects (no NIF-init libname) compiled + linked into the app .so so a
+    # plugin's Java_<pkg>_<Class>_* thunks resolve. Empty when none.
+    plugin_jni_sources =
+      MobDev.Plugin.Merge.jni_sources(MobDev.Plugin.activated()) |> Enum.join(",")
 
     base_args = [
       "build",
@@ -244,6 +774,19 @@ defmodule MobDev.NativeBuild do
       "-Dexqlite_src=#{Path.join(project_root, "deps/exqlite/c_src")}"
     ]
 
+    # Only emit -Dplugin_* when non-empty. A plugin-aware build.zig defaults
+    # these to "" (so omitting them is equivalent there), but an app scaffolded
+    # before the plugin system has no such option and Zig rejects the unknown
+    # -D flag. Gating keeps non-plugin apps on older mob scaffolding building.
+    plugin_args =
+      for {name, val} <- [
+            {"plugin_c_nifs", plugin_c_nifs},
+            {"plugin_zig_nifs", plugin_zig_nifs},
+            {"plugin_jni_sources", plugin_jni_sources}
+          ],
+          val != "",
+          do: "-D#{name}=#{val}"
+
     # `project_nif_zig_args/1` also emits `-Dproject_root=` (since the
     # iOS templates need it and don't have a baseline equivalent). The
     # Android base_args above already supply it for the existing
@@ -253,28 +796,37 @@ defmodule MobDev.NativeBuild do
     # but received a list".
     nif_args_no_root = Enum.reject(nif_args, &String.starts_with?(&1, "-Dproject_root="))
 
-    args = base_args ++ nif_args_no_root ++ nxeigen_zig_args_android(nxeigen_archive)
+    # Activated plugins' cpp_archive NIFs (e.g. an Nx CPU backend): each
+    # cross-compiled to lib<mod>.a for this ABI and static-linked via
+    # -Dplugin_static_libs. {:ok, []} when no such plugin is active; raises a
+    # hard build error when one IS active on an ABI CppArchive can't target
+    # (x86_64 emulator) rather than shipping an unresolved-symbol link failure.
+    plugin_archive_result =
+      case android_abi_to_cpp_target(abi) do
+        nil -> {:ok, []}
+        target_id -> build_plugin_static_archives(target_id, :android, otp_dir)
+      end
 
-    case System.cmd("zig", args, stderr_to_stdout: true, into: IO.stream()) do
-      {_, 0} -> :ok
-      {_, code} -> {:error, "zig build for #{abi} exited #{code}"}
+    with {:ok, plugin_archives} <- plugin_archive_result do
+      args =
+        base_args ++
+          plugin_args ++
+          nif_args_no_root ++
+          nxeigen_zig_args_android(nxeigen_archive) ++
+          tflite_zig_args_android(tflite_build) ++
+          plugin_static_lib_args(plugin_archives)
+
+      case System.cmd("zig", args, stderr_to_stdout: true, into: IO.stream()) do
+        {_, 0} -> :ok
+        {_, code} -> {:error, "zig build for #{abi} exited #{code}"}
+      end
     end
   end
 
-  defp ndk_sysroot do
-    # NDK ships only one prebuilt — darwin-x86_64 even on Apple Silicon
-    # (Apple's Rosetta 2 covers it). On Linux it'd be linux-x86_64.
-    host =
-      case :os.type() do
-        {:unix, :darwin} -> "darwin-x86_64"
-        {:unix, :linux} -> "linux-x86_64"
-        other -> raise "unsupported host for NDK: #{inspect(other)}"
-      end
-
-    sdk_root = System.get_env("ANDROID_HOME") || Path.expand("~/Library/Android/sdk")
-    ndk_version = MobDev.NdkVersion.effective()
-    Path.join([sdk_root, "ndk", ndk_version, "toolchains", "llvm", "prebuilt", host, "sysroot"])
-  end
+  # Single source of truth in MobDev.NdkVersion (honors ANDROID_HOME /
+  # ANDROID_SDK_ROOT + host detection) — shared with cpp_archive / nx_eigen_nif
+  # so the NDK path can't diverge again (MOB-89).
+  defp ndk_sysroot, do: MobDev.NdkVersion.sysroot()
 
   defp resolve_driver_tab_android(mob_dir) do
     resolve_driver_tab(mob_dir, "android", ["android", "jni"])
@@ -917,23 +1469,62 @@ defmodule MobDev.NativeBuild do
   # them the apk_data_file SELinux label (required for execve).
   defp ensure_jni_libs(otp_dir, abi) do
     jni_libs = "android/app/src/main/jniLibs/#{abi}"
-    File.mkdir_p!(jni_libs)
 
-    erts_bins = Path.wildcard("#{otp_dir}/erts-*/bin") |> List.first()
-
-    if erts_bins do
-      for {exe, lib} <- [
-            {"erl_child_setup", "liberl_child_setup.so"},
-            {"inet_gethost", "libinet_gethost.so"},
-            {"epmd", "libepmd.so"}
-          ] do
-        src = Path.join(erts_bins, exe)
-        dst = Path.join(jni_libs, lib)
-        if File.exists?(src), do: cp(src, dst)
-      end
+    with [erts_bins] <- Path.wildcard("#{otp_dir}/erts-*/bin"),
+         :ok <- validate_android_erts_helpers(erts_bins),
+         :ok <- mkdir_android_jni_libs(jni_libs) do
+      Enum.reduce_while(@android_erts_helpers, :ok, fn {exe, lib}, :ok ->
+        case replace_android_jni_helper(
+               Path.join(erts_bins, exe),
+               Path.join(jni_libs, lib)
+             ) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+    else
+      {:error, _reason} = error -> error
+      _missing_or_ambiguous -> {:error, "Android ERTS helper source is missing or ambiguous"}
     end
+  end
 
-    :ok
+  defp validate_android_erts_helpers(erts_bins) do
+    if Enum.all?(@android_erts_helpers, fn {exe, _lib} ->
+         File.regular?(Path.join(erts_bins, exe))
+       end) do
+      :ok
+    else
+      {:error, "Android ERTS helper source is incomplete"}
+    end
+  end
+
+  defp mkdir_android_jni_libs(jni_libs) do
+    case File.mkdir_p(jni_libs) do
+      :ok -> :ok
+      {:error, _reason} -> {:error, "Could not prepare Android JNI library directory"}
+    end
+  end
+
+  defp replace_android_jni_helper(source, destination) do
+    staged =
+      destination <>
+        ".mob-stage-#{System.unique_integer([:positive, :monotonic])}"
+
+    try do
+      with :ok <- File.cp(source, staged),
+           :ok <- File.rename(staged, destination),
+           {:ok, source_bytes} <- File.read(source),
+           {:ok, destination_bytes} <- File.read(destination),
+           true <-
+             :crypto.hash(:sha256, source_bytes) ==
+               :crypto.hash(:sha256, destination_bytes) do
+        :ok
+      else
+        _failure -> {:error, "Could not stage Android ERTS helpers"}
+      end
+    after
+      File.rm(staged)
+    end
   end
 
   defp gradle_assemble do
@@ -946,6 +1537,7 @@ defmodule MobDev.NativeBuild do
     # force-stop, etc.) and cause subsequent runs to hang silently while the wrapper
     # waits to acquire the lock. Clear them before every build.
     clear_stale_gradle_locks()
+    remove_stale_release_otp_zip(android_dir)
 
     if File.exists?(gradlew) do
       # Run gradlew as `bash scriptpath args` rather than exec-ing it directly
@@ -978,6 +1570,24 @@ defmodule MobDev.NativeBuild do
     end
   end
 
+  # `mix mob.release --android` used to write the release OTP bundle to the
+  # shared `src/main/assets/otp.zip`, which Gradle merges into every build
+  # variant including debug. A prior release build then poisons every
+  # subsequent debug deploy: MobBridge.kt's extractOtpIfNeeded() re-extracts
+  # that stale zip on the next app launch (keyed off PackageInfo.lastUpdateTime,
+  # which changes on every reinstall), silently overwriting freshly pushed dev
+  # BEAMs with the release snapshot. Release builds now write to the
+  # variant-scoped `src/release/assets/` instead (never merged into debug), but
+  # existing checkouts may still carry a leftover `src/main/assets/otp.zip`
+  # from before that fix — remove it so debug builds can't be poisoned by it.
+  @doc false
+  @spec remove_stale_release_otp_zip(String.t()) :: :ok
+  def remove_stale_release_otp_zip(android_dir) do
+    stale = Path.join([android_dir, "app", "src", "main", "assets", "otp.zip"])
+    if File.exists?(stale), do: File.rm!(stale)
+    :ok
+  end
+
   # Remove stale Gradle lock files left behind when a build is interrupted
   # (Ctrl+C, kill, etc.). These cause the next run to hang indefinitely while
   # the wrapper waits to acquire the lock.
@@ -999,279 +1609,2587 @@ defmodule MobDev.NativeBuild do
     end)
   end
 
-  defp adb_install_all(apk, bundle_id, device_id) do
-    case System.cmd("adb", ["devices"], stderr_to_stdout: true) do
-      {output, 0} ->
-        serials =
-          output
-          |> String.split("\n")
-          |> Enum.drop(1)
-          |> Enum.filter(&String.contains?(&1, "\tdevice"))
-          |> Enum.map(&hd(String.split(&1, "\t")))
-          |> filter_serials(device_id)
+  @doc false
+  @spec resolve_android_update_targets(String.t() | nil) ::
+          {:ok, [String.t()]} | {:error, atom()}
+  def resolve_android_update_targets(device_id) do
+    resolve_android_update_targets(device_id, &run_system_command/2)
+  end
 
-        Enum.each(serials, fn serial ->
-          IO.puts("  Installing APK on #{serial}...")
-
-          System.cmd("adb", ["-s", serial, "shell", "am", "force-stop", bundle_id],
-            stderr_to_stdout: true
-          )
-
-          System.cmd("adb", ["-s", serial, "uninstall", bundle_id], stderr_to_stdout: true)
-
-          {install_out, install_rc} =
-            System.cmd("adb", ["-s", serial, "install", apk], stderr_to_stdout: true)
-
-          if install_rc != 0 or String.contains?(install_out, "INSTALL_FAILED") do
-            reason =
-              install_out
-              |> String.split("\n")
-              |> Enum.find(&String.contains?(&1, "INSTALL_FAILED")) || String.trim(install_out)
-
-            IO.puts(
-              "  #{IO.ANSI.yellow()}⚠  #{serial}: APK install failed — #{reason}#{IO.ANSI.reset()}"
-            )
-
-            IO.puts("     (OTP push will be skipped for this device)")
-          else
-            fix_erts_helper_labels(serial, bundle_id)
-          end
-        end)
-
-        :ok
-
-      {out, _} ->
-        {:error, "adb devices failed: #{out}"}
+  @doc false
+  @spec resolve_android_update_targets(String.t() | nil, command_runner()) ::
+          {:ok, [String.t()]} | {:error, atom()}
+  def resolve_android_update_targets(nil, runner) do
+    case invoke_command(runner, "adb", ["devices"]) do
+      {:ok, output, 0} -> resolve_adb_targets(output, nil)
+      _ -> {:error, :device_discovery_failed}
     end
   end
 
-  # Android 15 streaming install labels ERTS helper .so files as app_data_file
-  # instead of apk_data_file, blocking execute_no_trans by untrusted_app.
-  # Fix by chcon-ing them back to apk_data_file (requires root / emulator).
-  defp fix_erts_helper_labels(serial, bundle_id) do
-    adb = fn args -> System.cmd("adb", ["-s", serial | args], stderr_to_stdout: true) end
-
-    # Only works on rooted/emulator builds — silently skip on real devices.
-    rooted? =
-      case adb.(["root"]) do
-        {out, 0} -> out =~ "restarting" or out =~ "already running as root"
-        _ -> false
+  def resolve_android_update_targets(device_id, runner) when is_binary(device_id) do
+    if valid_adb_serial?(device_id) do
+      case invoke_command(runner, "adb", ["devices"]) do
+        {:ok, output, 0} -> resolve_adb_targets(output, device_id)
+        _ -> {:error, :device_discovery_failed}
       end
-
-    if rooted? do
-      :timer.sleep(800)
-
-      {lib_dir_out, _} =
-        adb.([
-          "shell",
-          "pm dump #{bundle_id} | grep nativeLibraryDir | head -1 | awk '{print $NF}'"
-        ])
-
-      lib_dir = String.trim(lib_dir_out)
-
-      if lib_dir != "" do
-        for lib <- ["liberl_child_setup.so", "libinet_gethost.so", "libepmd.so"] do
-          adb.(["shell", "chcon", "u:object_r:apk_data_file:s0", "#{lib_dir}/#{lib}"])
-        end
-      end
+    else
+      {:error, :invalid_target}
     end
   end
 
-  defp push_otp_release_android(bundle_id, elixir_lib, otp_arm64, otp_arm32, device_id) do
+  def resolve_android_update_targets(_device_id, _runner), do: {:error, :invalid_target}
+
+  @doc false
+  @deprecated "use install_and_deliver_android_runtime/8 with an authoritative payload plan"
+  @spec install_android_updates(String.t(), [String.t()]) ::
+          {:ok, android_update_outcome()}
+          | {:error, android_update_outcome() | atom()}
+  def install_android_updates(apk, serials) do
+    install_android_updates(apk, serials, &run_system_command/2)
+  end
+
+  @doc false
+  @deprecated "use install_and_deliver_android_runtime/8 with an authoritative payload plan"
+  @spec install_android_updates(String.t(), [String.t()], command_runner()) ::
+          {:ok, android_update_outcome()}
+          | {:error, android_update_outcome() | atom()}
+  def install_android_updates(apk, serials, runner)
+
+  def install_android_updates(apk, serials, _runner)
+      when not is_binary(apk) or apk == "" or not is_list(serials),
+      do: {:error, :invalid_update_request}
+
+  def install_android_updates(_apk, [], _runner), do: {:error, :no_explicit_targets}
+
+  def install_android_updates(_apk, serials, _runner)
+      when length(serials) > @max_android_update_targets,
+      do: {:error, :too_many_targets}
+
+  def install_android_updates(_apk, serials, _runner) do
+    with :ok <- validate_android_update_serials(serials) do
+      {:error, :authoritative_transaction_required}
+    end
+  end
+
+  @doc false
+  @deprecated "use install_and_deliver_android_runtime/8 with an authoritative payload plan"
+  @spec install_and_deliver_android(
+          String.t(),
+          [String.t()],
+          command_runner(),
+          (String.t() -> :ok | {:error, term()})
+        ) :: :ok | {:error, String.t()}
+  def install_and_deliver_android(apk, serials, runner, _deliver) do
+    case install_android_updates(apk, serials, runner) do
+      {:error, reason} ->
+        {:error, android_update_request_error(reason)}
+    end
+  end
+
+  @doc false
+  @spec install_and_deliver_android_runtime(
+          String.t(),
+          [String.t()],
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) ::
+          {:ok, map()}
+          | {:error, String.t()}
+          | {:error, String.t(), map()}
+          | {:error, {:partial_update, String.t()}, map()}
+  def install_and_deliver_android_runtime(
+        apk,
+        serials,
+        bundle_id,
+        elixir_lib,
+        otp_arm64,
+        otp_arm32,
+        otp_x86_64,
+        opts \\ []
+      ) do
+    runner = Keyword.get(opts, :probe_runner, &run_system_command/2)
+    manifest_runner = Keyword.get(opts, :manifest_runner, &run_system_command/2)
+    otp_runner = Keyword.get(opts, :otp_runner, &run_system_command/3)
     app_data = "/data/data/#{bundle_id}/files"
 
-    IO.puts("  Pushing OTP release to device(s)...")
+    with :ok <- validate_android_bundle_id(bundle_id),
+         :ok <- validate_android_app_data(app_data, bundle_id),
+         {:ok, canonical_serials} <- canonical_android_runtime_serials(serials),
+         :ok <- preflight_android_otp_candidates(otp_arm64, otp_arm32, otp_x86_64, elixir_lib),
+         {:ok, preinstall, cleanup} <- android_preinstall_callbacks(opts),
+         {:ok, apk_snapshot} <- snapshot_android_apk(apk, opts) do
+      try do
+        with :ok <- validate_android_apk_identity(apk_snapshot.path, bundle_id, manifest_runner),
+             :ok <- preflight_installed_android_targets(canonical_serials, bundle_id, runner),
+             {:ok, selections} <-
+               select_android_otp_sources(
+                 canonical_serials,
+                 otp_arm64,
+                 otp_arm32,
+                 otp_x86_64,
+                 runner
+               ),
+             {:ok, payload_plan} <-
+               invoke_android_preinstall(
+                 preinstall,
+                 cleanup,
+                 bundle_id,
+                 canonical_serials,
+                 selections,
+                 apk_snapshot
+               ) do
+          case Keyword.get(opts, :resume_native_ready, false) do
+            true ->
+              resume_android_native_ready(
+                payload_plan,
+                selections,
+                elixir_lib,
+                cleanup,
+                runner,
+                opts
+              )
 
-    case System.cmd("adb", ["devices"], stderr_to_stdout: true) do
-      {output, 0} ->
-        serials = parse_adb_serials(output) |> filter_serials(device_id)
-        if serials == [], do: IO.puts("  (no devices connected, skipping OTP push)")
+            false ->
+              run_android_runtime_transaction(
+                apk_snapshot,
+                canonical_serials,
+                bundle_id,
+                app_data,
+                elixir_lib,
+                selections,
+                payload_plan,
+                cleanup,
+                runner,
+                otp_runner,
+                opts
+              )
 
-        Enum.reduce_while(serials, :ok, fn serial, _ ->
-          otp_dir = device_otp_dir(serial, otp_arm64, otp_arm32)
-
-          result =
-            try do
-              push_otp_to_device(serial, bundle_id, app_data, otp_dir, elixir_lib)
-            catch
-              {:skip, _} -> :ok
-            end
-
-          case result do
-            :ok -> {:cont, :ok}
-            {:error, reason} -> {:halt, {:error, reason}}
+            _invalid ->
+              cleanup_android_payload(cleanup, payload_plan)
+              {:error, "Invalid Android native-ready recovery option"}
           end
-        end)
-
-      {out, _} ->
-        {:error, "adb devices failed: #{out}"}
+        end
+      after
+        File.rm(apk_snapshot.path)
+      end
     end
   end
 
-  defp device_otp_dir(serial, otp_arm64, otp_arm32) do
-    {abi_out, _} =
-      System.cmd("adb", ["-s", serial, "shell", "getprop", "ro.product.cpu.abi"],
-        stderr_to_stdout: true
-      )
+  defp resume_android_native_ready(payload_plan, selections, elixir_lib, cleanup, runner, opts) do
+    adb_runner = fn args -> runner.("adb", args) end
 
-    abi = String.trim(abi_out)
-    otp_dir_for_abi(abi, otp_arm64, otp_arm32)
+    with {:ok, runtime_provenance} <-
+           android_recovery_runtime_provenance(payload_plan.serials, selections, elixir_lib) do
+      recovery_opts =
+        opts
+        |> Keyword.get(:android_recovery_opts, [])
+        |> Keyword.put(:runtime_provenance, runtime_provenance)
+        |> Keyword.put(:payload_validator, fn plan ->
+          validate_android_recovery_payload(plan, selections)
+        end)
+
+      case AndroidDeployRecoveryProof.resume(payload_plan, adb_runner, recovery_opts) do
+        {:ok, lease} ->
+          {:ok, %{deploy_lock: lease, payload_plan: payload_plan}}
+
+        {:error, :recovery_cas_ambiguous, retained_lease} ->
+          cleanup_android_payload(cleanup, payload_plan)
+          {:error, "Android native-ready recovery became ambiguous", retained_lease}
+
+        {:error, {:recovery_proof_refused, code}} ->
+          cleanup_android_payload(cleanup, payload_plan)
+
+          {:error,
+           "Android native-ready recovery proof was refused (#{recovery_refusal_label(code)})"}
+
+        {:error, _refused} ->
+          cleanup_android_payload(cleanup, payload_plan)
+
+          {:error,
+           "Android native-ready recovery proof was refused (recovery_transition_refused)"}
+      end
+    else
+      _unproven_runtime ->
+        cleanup_android_payload(cleanup, payload_plan)
+        {:error, "Android native-ready recovery runtime provenance was refused"}
+    end
   end
+
+  defp recovery_refusal_label(code)
+       when code in [
+              :payload_identity_invalid,
+              :payload_invalid,
+              :host_lock_unavailable,
+              :transport_identity_mismatch,
+              :lease_record_invalid,
+              :apk_signature_invalid,
+              :apk_identity_mismatch,
+              :runtime_provenance_mismatch,
+              :staging_not_clear,
+              :recovery_transition_refused
+            ],
+       do: Atom.to_string(code)
+
+  defp recovery_refusal_label(_unknown), do: "recovery_transition_refused"
+
+  defp android_recovery_runtime_provenance([serial], selections, elixir_lib) do
+    with %{otp_dir: otp_dir} <- Map.get(selections, serial),
+         {:ok, sentinels} <- android_runtime_sentinels(otp_dir, elixir_lib),
+         {:ok, provenance} <- hash_android_runtime_sentinels(sentinels, otp_dir, elixir_lib) do
+      {:ok, provenance}
+    else
+      _invalid_or_missing -> {:error, :runtime_provenance_unavailable}
+    end
+  end
+
+  defp android_recovery_runtime_provenance(_serials, _selections, _elixir_lib),
+    do: {:error, :runtime_provenance_unavailable}
+
+  defp hash_android_runtime_sentinels(sentinels, otp_dir, elixir_lib) do
+    Enum.reduce_while(sentinels, {:ok, []}, fn sentinel, {:ok, acc} ->
+      with {:ok, local_path} <- runtime_sentinel_local_path(sentinel, otp_dir, elixir_lib),
+           true <- File.regular?(local_path),
+           {:ok, digest} <- file_sha256(local_path) do
+        entry = %{path: sentinel, sha256: Base.encode16(digest, case: :lower)}
+        {:cont, {:ok, [entry | acc]}}
+      else
+        _missing_or_changed -> {:halt, {:error, :runtime_provenance_unavailable}}
+      end
+    end)
+    |> case do
+      {:ok, entries} -> {:ok, Enum.reverse(entries)}
+      error -> error
+    end
+  end
+
+  defp runtime_sentinel_local_path("otp/erts-" <> _rest = sentinel, otp_dir, _elixir_lib),
+    do: {:ok, Path.join(otp_dir, String.replace_prefix(sentinel, "otp/", ""))}
+
+  defp runtime_sentinel_local_path("otp/lib/" <> rest, _otp_dir, elixir_lib),
+    do: {:ok, Path.join(elixir_lib, rest)}
+
+  defp runtime_sentinel_local_path(_sentinel, _otp_dir, _elixir_lib),
+    do: {:error, :runtime_provenance_unavailable}
+
+  @doc false
+  @spec validate_android_recovery_payload(map()) :: :ok | {:error, :invalid_recovery_payload}
+  def validate_android_recovery_payload(payload_plan) when is_map(payload_plan) do
+    validate_android_recovery_payload_plan(payload_plan, nil)
+  end
+
+  def validate_android_recovery_payload(_payload_plan),
+    do: {:error, :invalid_recovery_payload}
+
+  @doc false
+  @spec validate_android_recovery_payload(map(), map()) ::
+          :ok | {:error, :invalid_recovery_payload}
+  def validate_android_recovery_payload(payload_plan, selections)
+      when is_map(payload_plan) and is_map(selections) do
+    validate_android_recovery_payload_plan(payload_plan, selections)
+  end
+
+  def validate_android_recovery_payload(_payload_plan, _selections),
+    do: {:error, :invalid_recovery_payload}
+
+  defp validate_android_recovery_payload_plan(payload_plan, selections) do
+    with %{
+           version: 1,
+           package: package,
+           serials: serials,
+           selected_abis: selected_abis,
+           selected_abis_by_serial: selected_by_serial,
+           apk: %{path: apk_path, size: apk_size, sha256: apk_sha256}
+         } <- payload_plan,
+         input <- %{
+           bundle_id: package,
+           serials: serials,
+           selected_abis: selected_abis,
+           selected_abis_by_serial: selected_by_serial,
+           apk: apk_path,
+           apk_size: apk_size,
+           apk_sha256: apk_sha256
+         },
+         {:ok, ^payload_plan} <-
+           validate_android_payload_plan(payload_plan, input, require_distinct_apk_source?: false),
+         :ok <- validate_android_local_file_identity(payload_plan.apk, @max_android_apk_bytes),
+         :ok <- maybe_validate_android_recovery_runtime(apk_path, selections, payload_plan) do
+      :ok
+    else
+      _invalid_or_changed -> {:error, :invalid_recovery_payload}
+    end
+  rescue
+    _error -> {:error, :invalid_recovery_payload}
+  catch
+    _kind, _reason -> {:error, :invalid_recovery_payload}
+  end
+
+  defp maybe_validate_android_recovery_runtime(_apk_path, nil, _payload_plan),
+    do: {:error, :runtime_selections_required}
+
+  defp maybe_validate_android_recovery_runtime(apk_path, selections, payload_plan) do
+    validate_android_apk_runtime(apk_path, selections, payload_plan)
+  end
+
+  defp snapshot_android_apk(apk, opts) when is_binary(apk) do
+    tmp_root = Keyword.get(opts, :tmp_root, System.tmp_dir!())
+    snapshot_id = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
+    snapshot = Path.join(tmp_root, "mob_apk_#{snapshot_id}.apk")
+
+    with {:ok, %{size: source_size}}
+         when source_size > 0 and
+                source_size <= @max_android_apk_bytes <-
+           File.stat(apk),
+         :ok <- File.cp(apk, snapshot),
+         :ok <- File.chmod(snapshot, 0o400),
+         {:ok, %{size: ^source_size}} <- File.stat(snapshot),
+         {:ok, sha256} <- file_sha256(snapshot) do
+      {:ok, %{path: snapshot, size: source_size, sha256: sha256}}
+    else
+      _failure ->
+        File.rm(snapshot)
+        {:error, "Could not snapshot exact Android APK; refusing update"}
+    end
+  end
+
+  defp snapshot_android_apk(_apk, _opts),
+    do: {:error, "Android APK path is invalid; refusing update"}
+
+  defp file_sha256(path) do
+    case File.open(path, [:read, :binary], fn io ->
+           hash_file_chunks(io, :crypto.hash_init(:sha256))
+         end) do
+      {:ok, digest} when is_binary(digest) -> {:ok, digest}
+      _failure -> {:error, :hash_failed}
+    end
+  end
+
+  defp hash_file_chunks(io, context) do
+    case IO.binread(io, 1_048_576) do
+      :eof -> :crypto.hash_final(context)
+      {:error, _reason} -> {:error, :read_failed}
+      bytes when is_binary(bytes) -> hash_file_chunks(io, :crypto.hash_update(context, bytes))
+    end
+  end
+
+  defp android_preinstall_callbacks(opts) do
+    preinstall = Keyword.get(opts, :android_preinstall)
+    cleanup = Keyword.get(opts, :android_preinstall_cleanup)
+
+    if is_function(preinstall, 1) and is_function(cleanup, 1) do
+      {:ok, preinstall, cleanup}
+    else
+      {:error, "Android device phase requires an authoritative payload plan"}
+    end
+  end
+
+  defp invoke_android_preinstall(
+         preinstall,
+         cleanup,
+         bundle_id,
+         serials,
+         selections,
+         apk_snapshot
+       ) do
+    selected_abis_by_serial =
+      Map.new(selections, fn {serial, %{abi: abi}} -> {serial, abi} end)
+
+    input = %{
+      apk: apk_snapshot.path,
+      apk_sha256: Base.encode16(apk_snapshot.sha256, case: :lower),
+      apk_size: apk_snapshot.size,
+      bundle_id: bundle_id,
+      serials: Enum.sort(serials),
+      selected_abis: selected_android_abis(selections),
+      selected_abis_by_serial: selected_abis_by_serial
+    }
+
+    try do
+      case preinstall.(input) do
+        {:ok, payload_plan} ->
+          case validate_android_payload_plan(payload_plan, input) do
+            {:ok, _payload_plan} = ok ->
+              ok
+
+            {:error, _reason} = error ->
+              cleanup_android_payload_after_failure(cleanup, payload_plan, error)
+          end
+
+        {:error, _bounded_reason} ->
+          {:error, "Could not prepare authoritative Android payload"}
+
+        _invalid ->
+          {:error, "Authoritative Android payload plan is invalid"}
+      end
+    catch
+      _kind, _reason -> {:error, "Could not prepare authoritative Android payload"}
+    end
+  end
+
+  defp validate_android_payload_plan(payload_plan, input, opts \\ [])
+
+  defp validate_android_payload_plan(payload_plan, input, opts)
+       when is_map(payload_plan) and is_map(input) do
+    with true <-
+           exact_map_keys?(payload_plan, [
+             :version,
+             :package,
+             :attempt_id,
+             :serials,
+             :selected_abis,
+             :selected_abis_by_serial,
+             :apk,
+             :beam,
+             :exqlite,
+             :restart_by_serial
+           ]),
+         1 <- payload_plan.version,
+         true <- payload_plan.package == input.bundle_id,
+         true <- payload_plan.serials == input.serials,
+         true <- payload_plan.selected_abis == input.selected_abis,
+         true <- payload_plan.selected_abis_by_serial == input.selected_abis_by_serial,
+         true <- valid_android_attempt_id?(payload_plan.attempt_id),
+         :ok <- validate_android_plan_apk(payload_plan.apk, input, opts),
+         :ok <-
+           validate_android_beam_plan(
+             payload_plan.beam,
+             payload_plan.package,
+             payload_plan.attempt_id
+           ),
+         :ok <-
+           validate_android_exqlite_plan(
+             payload_plan.exqlite,
+             payload_plan.package,
+             payload_plan.attempt_id,
+             payload_plan.selected_abis
+           ),
+         :ok <-
+           validate_android_restart_plan(
+             payload_plan.restart_by_serial,
+             payload_plan.package,
+             payload_plan.serials
+           ),
+         true <- android_plan_local_paths_distinct?(payload_plan) do
+      {:ok, payload_plan}
+    else
+      _invalid -> {:error, "Authoritative Android payload plan identity is invalid"}
+    end
+  end
+
+  defp validate_android_payload_plan(_payload_plan, _input, _opts),
+    do: {:error, "Authoritative Android payload plan identity is invalid"}
+
+  defp exact_map_keys?(map, keys) do
+    MapSet.new(Map.keys(map)) == MapSet.new(keys)
+  end
+
+  defp valid_android_attempt_id?(attempt_id) when is_binary(attempt_id) do
+    String.valid?(attempt_id) and
+      Regex.match?(Regex.compile!(@android_attempt_id_pattern), attempt_id)
+  end
+
+  defp valid_android_attempt_id?(_attempt_id), do: false
+
+  defp validate_android_plan_apk(apk, input, opts) do
+    require_distinct_source? = Keyword.get(opts, :require_distinct_apk_source?, true)
+
+    with :ok <- validate_android_local_file_identity(apk, @max_android_apk_bytes),
+         true <- not require_distinct_source? or apk.path != input.apk,
+         true <- apk.size == input.apk_size,
+         true <- apk.sha256 == input.apk_sha256 do
+      :ok
+    else
+      _invalid -> {:error, :invalid_plan_apk}
+    end
+  end
+
+  defp validate_android_local_file_identity(identity, max_bytes) when is_map(identity) do
+    with true <- exact_map_keys?(identity, [:path, :size, :sha256]),
+         true <- safe_android_local_plan_path?(identity.path),
+         true <- is_integer(identity.size) and identity.size > 0 and identity.size <= max_bytes,
+         true <- valid_sha256_hex?(identity.sha256),
+         {:ok, %{type: :regular, size: size, mode: mode}} <- File.stat(identity.path),
+         true <- size == identity.size,
+         true <- Bitwise.band(mode, 0o222) == 0,
+         {:ok, digest} <- file_sha256(identity.path),
+         true <- Base.encode16(digest, case: :lower) == identity.sha256 do
+      :ok
+    else
+      _invalid -> {:error, :invalid_local_plan_file}
+    end
+  end
+
+  defp validate_android_local_file_identity(_identity, _max_bytes),
+    do: {:error, :invalid_local_plan_file}
+
+  defp safe_android_local_plan_path?(path) do
+    is_binary(path) and byte_size(path) in 1..2_048 and String.valid?(path) and
+      Path.type(path) == :absolute and not Enum.member?(Path.split(path), "..")
+  end
+
+  defp valid_sha256_hex?(sha256) when is_binary(sha256) do
+    Regex.match?(Regex.compile!("\\A[0-9a-f]{64}\\z"), sha256)
+  end
+
+  defp valid_sha256_hex?(_sha256), do: false
+
+  defp validate_android_beam_plan(beam, package, attempt_id) when is_map(beam) do
+    with true <-
+           exact_map_keys?(beam, [
+             :archive,
+             :stage_device,
+             :app_stage,
+             :app_backup,
+             :activation_lock,
+             :dist_snapshot,
+             :runtime_version,
+             :beam_flags
+           ]),
+         :ok <- validate_android_local_file_identity(beam.archive, @max_android_apk_bytes),
+         :ok <-
+           validate_android_beam_remote_paths(beam, package, attempt_id),
+         :ok <- validate_android_dist_snapshot(beam.dist_snapshot),
+         true <- beam.runtime_version == System.version(),
+         true <- valid_android_beam_flags?(beam.beam_flags) do
+      :ok
+    else
+      _invalid -> {:error, :invalid_beam_plan}
+    end
+  end
+
+  defp validate_android_beam_plan(_beam, _package, _attempt_id),
+    do: {:error, :invalid_beam_plan}
+
+  defp validate_android_beam_remote_paths(plan, package, attempt_id) do
+    app_data = "/data/data/#{package}/files"
+
+    if plan.stage_device == "/data/local/tmp/mob_beams_#{attempt_id}.tar" and
+         plan.app_stage == "#{app_data}/.mob_beams_stage_#{attempt_id}" and
+         plan.app_backup == "#{app_data}/.mob_beams_backup_#{attempt_id}" and
+         plan.activation_lock == "#{app_data}/.mob_beams_activation_lock" do
+      :ok
+    else
+      {:error, :invalid_remote_plan_paths}
+    end
+  end
+
+  defp validate_android_dist_snapshot(snapshot) do
+    case MobDev.HotPush.validate_prepared_snapshot(snapshot) do
+      :ok -> :ok
+      {:error, _reason} -> {:error, :invalid_dist_snapshot}
+    end
+  end
+
+  defp valid_android_beam_flags?(nil), do: true
+
+  defp valid_android_beam_flags?(flags) when is_binary(flags),
+    do: byte_size(flags) <= 4_096 and String.valid?(flags)
+
+  defp valid_android_beam_flags?(_flags), do: false
+
+  defp validate_android_exqlite_plan(nil, _package, _attempt_id, _selected_abis), do: :ok
+
+  defp validate_android_exqlite_plan(exqlite, package, attempt_id, selected_abis)
+       when is_map(exqlite) do
+    with true <-
+           exact_map_keys?(exqlite, [
+             :archive,
+             :stage_device,
+             :app_stage,
+             :app_backup,
+             :activation_lock,
+             :app_version,
+             :beam_sentinel,
+             :nif
+           ]),
+         :ok <- validate_android_local_file_identity(exqlite.archive, @max_android_apk_bytes),
+         :ok <-
+           validate_android_exqlite_remote_paths(exqlite, package, attempt_id),
+         true <- valid_android_plan_component?(exqlite.app_version, 128),
+         true <- valid_android_beam_sentinel?(exqlite.beam_sentinel),
+         :ok <- validate_android_exqlite_nif(exqlite.nif, selected_abis) do
+      :ok
+    else
+      _invalid -> {:error, :invalid_exqlite_plan}
+    end
+  end
+
+  defp validate_android_exqlite_plan(_exqlite, _package, _attempt_id, _selected_abis),
+    do: {:error, :invalid_exqlite_plan}
+
+  defp validate_android_exqlite_remote_paths(plan, package, attempt_id) do
+    lib_parent = "/data/data/#{package}/files/otp/lib"
+
+    if plan.stage_device == "/data/local/tmp/mob_exqlite_#{attempt_id}.tar" and
+         plan.app_stage == "#{lib_parent}/.mob_exqlite_stage_#{attempt_id}" and
+         plan.app_backup == "#{lib_parent}/.mob_exqlite_backup_#{attempt_id}" and
+         plan.activation_lock == "#{lib_parent}/.mob_exqlite_activation_lock" do
+      :ok
+    else
+      {:error, :invalid_remote_plan_paths}
+    end
+  end
+
+  defp validate_android_exqlite_nif(nif, selected_abis) when is_map(nif) do
+    expected_entries = Map.new(selected_abis, &{&1, "lib/#{&1}/libsqlite3_nif.so"})
+
+    if exact_map_keys?(nif, [
+         :source,
+         :filename,
+         :selected_abis,
+         :required_apk_entries
+       ]) and nif.source == :installed_apk and nif.filename == "libsqlite3_nif.so" and
+         nif.selected_abis == selected_abis and nif.required_apk_entries == expected_entries do
+      :ok
+    else
+      {:error, :invalid_exqlite_nif}
+    end
+  end
+
+  defp validate_android_exqlite_nif(_nif, _selected_abis),
+    do: {:error, :invalid_exqlite_nif}
+
+  defp valid_android_plan_component?(value, max_bytes) when is_binary(value) do
+    byte_size(value) in 1..max_bytes and String.valid?(value) and
+      Regex.match?(Regex.compile!("\\A[A-Za-z0-9._-]+\\z"), value)
+  end
+
+  defp valid_android_plan_component?(_value, _max_bytes), do: false
+
+  defp valid_android_beam_sentinel?(sentinel) when is_binary(sentinel) do
+    byte_size(sentinel) in 1..255 and String.valid?(sentinel) and
+      Path.basename(sentinel) == sentinel and
+      Regex.match?(Regex.compile!("\\A[A-Za-z0-9_.-]+\\.beam\\z"), sentinel)
+  end
+
+  defp valid_android_beam_sentinel?(_sentinel), do: false
+
+  defp validate_android_restart_plan(restarts, package, serials) when is_map(restarts) do
+    if Enum.sort(Map.keys(restarts)) == serials and
+         Enum.all?(restarts, fn {serial, restart} ->
+           valid_android_restart_entry?(serial, restart, package)
+         end) do
+      :ok
+    else
+      {:error, :invalid_restart_plan}
+    end
+  end
+
+  defp validate_android_restart_plan(_restarts, _package, _serials),
+    do: {:error, :invalid_restart_plan}
+
+  defp valid_android_restart_entry?(serial, restart, package) when is_map(restart) do
+    exact_map_keys?(restart, [
+      :package,
+      :activity,
+      :restart?,
+      :mode,
+      :dist_port,
+      :node_suffix
+    ]) and restart.package == package and valid_adb_serial?(serial) and
+      valid_android_activity?(restart.activity) and
+      valid_android_node_suffix?(restart.node_suffix) and
+      is_integer(restart.dist_port) and restart.dist_port in 1_024..65_535 and
+      restart.restart? == true and restart.mode == :checked_restart
+  end
+
+  defp valid_android_restart_entry?(_serial, _restart, _package), do: false
+
+  defp valid_android_activity?(activity) when is_binary(activity) do
+    byte_size(activity) in 1..255 and String.valid?(activity) and
+      Regex.match?(Regex.compile!("\\A\\.?[A-Za-z][A-Za-z0-9_.]*\\z"), activity)
+  end
+
+  defp valid_android_activity?(_activity), do: false
+
+  defp valid_android_node_suffix?(suffix) when is_binary(suffix) do
+    byte_size(suffix) in 1..128 and String.valid?(suffix) and
+      Regex.match?(Regex.compile!("\\A[A-Za-z0-9_]+\\z"), suffix)
+  end
+
+  defp valid_android_node_suffix?(_suffix), do: false
+
+  defp android_plan_local_paths_distinct?(payload_plan) do
+    paths =
+      [payload_plan.apk.path, payload_plan.beam.archive.path] ++
+        case payload_plan.exqlite do
+          nil -> []
+          exqlite -> [exqlite.archive.path]
+        end
+
+    Enum.uniq(paths) == paths
+  end
+
+  defp run_android_runtime_transaction(
+         apk_snapshot,
+         serials,
+         bundle_id,
+         app_data,
+         elixir_lib,
+         selections,
+         payload_plan,
+         cleanup,
+         runner,
+         otp_runner,
+         opts
+       ) do
+    try do
+      result =
+        with :ok <- verify_android_apk_snapshot(apk_snapshot),
+             :ok <- validate_android_local_file_identity(payload_plan.apk, @max_android_apk_bytes),
+             :ok <- validate_android_apk_runtime(payload_plan.apk.path, selections, payload_plan),
+             :ok <- verify_android_apk_snapshot(apk_snapshot),
+             {:ok, prepared} <-
+               prepare_selected_otp_archives(selections, app_data, elixir_lib, opts),
+             :ok <- validate_android_native_otp_plan(prepared, selections, app_data) do
+          try do
+            with {:ok, lock} <- acquire_android_deploy_lock(serials, bundle_id, runner, opts) do
+              run_locked_android_transaction(lock, fn ->
+                with :ok <- validate_android_native_otp_plan(prepared, selections, app_data) do
+                  case deploy_locked_android_otp(
+                         payload_plan.apk,
+                         serials,
+                         bundle_id,
+                         app_data,
+                         selections,
+                         prepared,
+                         lock,
+                         runner,
+                         otp_runner
+                       ) do
+                    :ok ->
+                      transition_android_after_update(lock, runner)
+
+                    {:error, {:android_partial_update, state, reason}}
+                    when state in [:retained_failure, :retained_ambiguous] ->
+                      {:error, {:partial_update, reason}, %{lock | state: state}}
+
+                    {:error, {:android_deploy_lease_ambiguous, reason}} ->
+                      {:error, reason, %{lock | state: :retained_ambiguous}}
+
+                    {:error, reason} ->
+                      {:error, reason, %{lock | state: :retained_failure}}
+                  end
+                else
+                  {:error, reason} -> {:error, reason, %{lock | state: :retained_failure}}
+                end
+              end)
+            end
+          after
+            cleanup_prepared_otp_archives(prepared)
+          end
+        end
+
+      case result do
+        {:ok, lock} ->
+          {:ok, %{deploy_lock: lock, payload_plan: payload_plan}}
+
+        {:error, _reason, _lock} = error ->
+          cleanup_android_payload_after_failure(cleanup, payload_plan, error)
+
+        {:error, _reason} = error ->
+          cleanup_android_payload_after_failure(cleanup, payload_plan, error)
+
+        _invalid ->
+          cleanup_android_payload_after_failure(
+            cleanup,
+            payload_plan,
+            {:error, "Authoritative Android runtime transaction returned an invalid result"}
+          )
+      end
+    catch
+      kind, reason ->
+        stacktrace = __STACKTRACE__
+        cleanup_android_payload(cleanup, payload_plan)
+        :erlang.raise(kind, reason, stacktrace)
+    end
+  end
+
+  defp run_locked_android_transaction(lock, transaction) do
+    try do
+      transaction.()
+    catch
+      _kind, _reason ->
+        {:error, "Android device transaction became ambiguous; deploy lease retained",
+         %{lock | state: :retained_ambiguous}}
+    end
+  end
+
+  defp transition_android_after_update(lock, runner) do
+    try do
+      case transition_android_deploy_lock(lock, :acquired, :native_ready, runner) do
+        {:ok, _transitioned} = ok ->
+          ok
+
+        {:error, reason, retained} ->
+          {:error,
+           {:partial_update,
+            "Android target set was updated but native-ready commit failed: #{reason}"}, retained}
+      end
+    catch
+      _kind, _reason ->
+        {:error,
+         {:partial_update,
+          "Android native-ready commit became ambiguous after device update; deploy lease retained"},
+         %{lock | state: :retained_ambiguous}}
+    end
+  end
+
+  defp verify_android_apk_snapshot(%{path: path, size: size, sha256: expected_sha256}) do
+    with {:ok, %{size: ^size}} <- File.stat(path),
+         {:ok, ^expected_sha256} <- file_sha256(path) do
+      :ok
+    else
+      _changed -> {:error, "Exact Android APK snapshot changed; refusing update"}
+    end
+  end
+
+  defp cleanup_android_payload(cleanup, payload_plan) do
+    try do
+      case cleanup.(payload_plan) do
+        :ok -> :ok
+        _invalid -> {:error, "Could not clean authoritative Android payload"}
+      end
+    catch
+      _kind, _reason -> {:error, "Could not clean authoritative Android payload"}
+    end
+  end
+
+  defp cleanup_android_payload_after_failure(cleanup, payload_plan, failure) do
+    cleanup_android_payload(cleanup, payload_plan)
+    failure
+  end
+
+  defp deploy_locked_android_otp(
+         apk,
+         serials,
+         bundle_id,
+         app_data,
+         selections,
+         prepared,
+         lock,
+         runner,
+         otp_runner
+       ) do
+    context = %{
+      apk: apk,
+      bundle_id: bundle_id,
+      app_data: app_data,
+      selections: selections,
+      prepared: prepared,
+      lock: lock,
+      runner: runner,
+      otp_runner: otp_runner
+    }
+
+    deploy_locked_android_targets(serials, context, false)
+  end
+
+  defp deploy_locked_android_targets([], _context, _updated?), do: :ok
+
+  defp deploy_locked_android_targets([serial | remaining], context, updated?) do
+    try do
+      %{abi: expected_abi, otp_dir: otp_dir} = Map.fetch!(context.selections, serial)
+      plan = Map.fetch!(context.prepared, otp_dir)
+
+      preinstall_result =
+        with :ok <- verify_android_prepared_otp_archive(plan, otp_dir, expected_abi),
+             :ok <- validate_android_local_file_identity(context.apk, @max_android_apk_bytes),
+             :ok <- verify_android_deploy_lock_set(context.lock, context.runner) do
+          :ok
+        end
+
+      case preinstall_result do
+        :ok ->
+          install_locked_android_target(
+            serial,
+            remaining,
+            expected_abi,
+            otp_dir,
+            plan,
+            context,
+            updated?
+          )
+
+        {:error, _reason} = error ->
+          maybe_partial_android_update(error, updated?)
+      end
+    catch
+      kind, reason ->
+        if updated? do
+          partial_android_update_ambiguous()
+        else
+          :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+    end
+  end
+
+  defp install_locked_android_target(
+         serial,
+         remaining,
+         expected_abi,
+         otp_dir,
+         plan,
+         context,
+         updated?
+       ) do
+    case invoke_android_install(context.apk.path, serial, context.runner) do
+      {:ok, ^serial} ->
+        case deliver_android_otp_after_install(serial, expected_abi, otp_dir, plan, context) do
+          :ok -> deploy_locked_android_targets(remaining, context, true)
+          {:error, _reason} = error -> partial_android_update_error(error)
+        end
+
+      {:error, %{reason: reason}} ->
+        if definite_android_install_rejection?(reason) do
+          maybe_partial_android_update(
+            {:error, "APK update failed: #{android_update_reason(reason)}"},
+            updated?
+          )
+        else
+          partial_android_update_ambiguous(
+            "Android APK update result was not authoritative; deploy lease retained"
+          )
+        end
+
+      _invalid_or_ambiguous ->
+        partial_android_update_ambiguous(
+          "Android APK update result was not authoritative; deploy lease retained"
+        )
+    end
+  end
+
+  defp invoke_android_install(apk, serial, runner) do
+    try do
+      install_android_update(apk, serial, runner)
+    catch
+      _kind, _reason ->
+        {:error,
+         {:android_install_ambiguous,
+          "Android APK update result was not authoritative; deploy lease retained"}}
+    end
+  end
+
+  defp deliver_android_otp_after_install(serial, expected_abi, otp_dir, plan, context) do
+    try do
+      with :ok <- verify_android_deploy_lock_set(context.lock, context.runner),
+           :ok <-
+             repair_erts_helper_labels(
+               serial,
+               context.bundle_id,
+               expected_abi,
+               context.lock,
+               context.runner
+             ),
+           :ok <- verify_android_deploy_lock_set(context.lock, context.runner),
+           :ok <- verify_android_prepared_otp_archive(plan, otp_dir, expected_abi) do
+        deploy_prepared_otp(
+          context.otp_runner,
+          context.runner,
+          context.lock,
+          serial,
+          context.bundle_id,
+          context.app_data,
+          plan
+        )
+      end
+    catch
+      _kind, _reason ->
+        {:error,
+         {:android_deploy_lease_ambiguous,
+          "Android device transaction became ambiguous after APK update; deploy lease retained"}}
+    end
+  end
+
+  defp maybe_partial_android_update({:error, _reason} = error, false), do: error
+
+  defp maybe_partial_android_update({:error, _reason} = error, true),
+    do: partial_android_update_error(error)
+
+  defp partial_android_update_error({:error, {:android_deploy_lease_ambiguous, reason}}),
+    do: partial_android_update_ambiguous(reason)
+
+  defp partial_android_update_error({:error, reason}) when is_binary(reason) do
+    {:error,
+     {:android_partial_update, :retained_failure,
+      "Android target set was partially updated before failure: #{reason}; deploy lease retained"}}
+  end
+
+  defp partial_android_update_error(_invalid), do: partial_android_update_ambiguous()
+
+  defp partial_android_update_ambiguous(
+         reason \\ "Android device transaction became ambiguous after APK update; deploy lease retained"
+       ) do
+    {:error, {:android_partial_update, :retained_ambiguous, reason}}
+  end
+
+  defp verify_android_deploy_lock_owner(
+         lock,
+         serial,
+         runner
+       ) do
+    case AndroidDeployLock.verify_owner(lock, serial, android_lock_runner(runner)) do
+      :ok -> :ok
+      {:error, _failure} -> {:error, "Android deploy lease owner could not be verified"}
+    end
+  end
+
+  defp verify_android_deploy_lock_set(lock, runner) do
+    Enum.reduce_while(lock.serials, :ok, fn serial, :ok ->
+      case verify_android_deploy_lock_owner(lock, serial, runner) do
+        :ok ->
+          {:cont, :ok}
+
+        {:error, _reason} ->
+          {:halt,
+           {:error,
+            {:android_deploy_lease_ambiguous,
+             "Android deploy lease set could not be verified; refusing mutation"}}}
+      end
+    end)
+  end
+
+  defp repair_erts_helper_labels(serial, bundle_id, expected_abi, lock, runner) do
+    case invoke_command(runner, "adb", ["-s", serial, "root"]) do
+      {:ok, output, status}
+      when is_binary(output) and is_integer(status) and
+             byte_size(output) <= @max_adb_install_result_bytes ->
+        if String.valid?(output) do
+          classify_android_root_response(String.trim(output), status)
+          |> case do
+            :not_rootable ->
+              :ok
+
+            {:rooted, restarted?} ->
+              with :ok <- maybe_wait_for_rooted_adb(serial, restarted?, runner),
+                   :ok <- verify_android_deploy_lock_set(lock, runner),
+                   {:ok, ^expected_abi} <- probe_android_abi(serial, runner),
+                   {:ok, apk_dir} <- probe_android_apk_dir(serial, bundle_id, runner),
+                   :ok <- relabel_erts_helpers(serial, apk_dir, expected_abi, lock, runner) do
+                :ok
+              else
+                {:error, _reason} = error -> error
+                _abi_drift -> {:error, "Android ABI changed during deploy; refusing OTP delivery"}
+              end
+
+            :invalid ->
+              {:error, "Could not classify adb root response; refusing OTP delivery"}
+          end
+        else
+          {:error, "Invalid adb root response; refusing OTP delivery"}
+        end
+
+      _invalid ->
+        {:error, "adb root probe failed; refusing OTP delivery"}
+    end
+  end
+
+  defp classify_android_root_response(output, 0) do
+    cond do
+      output in ["adbd is already running as root", "adbd already running as root"] ->
+        {:rooted, false}
+
+      output in ["restarting adbd as root", "restarting adbd as root\n"] ->
+        {:rooted, true}
+
+      output == "adbd cannot run as root in production builds" ->
+        :not_rootable
+
+      true ->
+        :invalid
+    end
+  end
+
+  defp classify_android_root_response(output, _status) do
+    if output == "adbd cannot run as root in production builds",
+      do: :not_rootable,
+      else: :invalid
+  end
+
+  defp maybe_wait_for_rooted_adb(_serial, false, _runner), do: :ok
+
+  defp maybe_wait_for_rooted_adb(serial, true, runner) do
+    checked_empty_android_command(runner, serial, ["wait-for-device"], "wait for rooted adb")
+  end
+
+  defp probe_android_abi(serial, runner) do
+    runner
+    |> invoke_command("adb", ["-s", serial, "shell", "getprop", "ro.product.cpu.abi"])
+    |> android_abi_from_probe()
+  end
+
+  defp probe_android_apk_dir(serial, bundle_id, runner) do
+    with {:ok, output, 0} <-
+           invoke_command(runner, "adb", ["-s", serial, "shell", "pm", "path", bundle_id]),
+         true <- byte_size(output) <= @max_adb_discovery_bytes,
+         true <- String.valid?(output) do
+      dirs =
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim/1)
+        |> Enum.reduce_while([], fn
+          "package:" <> path, dirs ->
+            if safe_android_apk_path?(path),
+              do: {:cont, [Path.dirname(path) | dirs]},
+              else: {:halt, :invalid}
+
+          _unexpected, _dirs ->
+            {:halt, :invalid}
+        end)
+
+      case dirs do
+        dirs when is_list(dirs) ->
+          case Enum.uniq(dirs) do
+            [dir] -> {:ok, dir}
+            _ -> {:error, "Android APK path is missing or ambiguous"}
+          end
+
+        :invalid ->
+          {:error, "Android APK path is invalid"}
+      end
+    else
+      _ -> {:error, "Could not locate Android APK path"}
+    end
+  end
+
+  defp relabel_erts_helpers(serial, apk_dir, abi, lock, runner) do
+    abi_dir = if abi == "armeabi-v7a", do: "arm", else: abi |> String.replace("-v8a", "")
+    lib_dir = Path.join([apk_dir, "lib", abi_dir])
+
+    if safe_android_absolute_path?(lib_dir) do
+      ["liberl_child_setup.so", "libinet_gethost.so", "libepmd.so"]
+      |> Enum.reduce_while(:ok, fn lib, :ok ->
+        case checked_empty_locked_android_command(
+               lock,
+               runner,
+               serial,
+               ["shell", "chcon", "u:object_r:apk_data_file:s0", Path.join(lib_dir, lib)],
+               "repair ERTS helper label"
+             ) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+    else
+      {:error, "Android native library path is invalid"}
+    end
+  end
+
+  defp checked_empty_android_command(runner, serial, args, operation) do
+    case invoke_command(runner, "adb", ["-s", serial | args]) do
+      {:ok, "", 0} -> :ok
+      _failure_or_ambiguity -> {:error, "#{operation} failed"}
+    end
+  end
+
+  defp checked_empty_locked_android_command(lock, runner, serial, args, operation) do
+    with :ok <- verify_android_deploy_lock_set(lock, runner) do
+      checked_empty_android_command(runner, serial, args, operation)
+    end
+  end
+
+  defp safe_android_absolute_path?(path) do
+    is_binary(path) and byte_size(path) <= 1_024 and String.valid?(path) and
+      Regex.match?(Regex.compile!("\\A/[A-Za-z0-9._/+=~:-]+\\z"), path) and
+      not Enum.member?(Path.split(path), "..")
+  end
+
+  defp safe_android_apk_path?(path) do
+    parent = if is_binary(path), do: Path.dirname(path), else: ""
+
+    safe_android_absolute_path?(path) and String.starts_with?(parent, "/data/app/") and
+      parent != "/data/app" and String.ends_with?(path, ".apk") and
+      Path.basename(path) not in ["", ".", ".."]
+  end
+
+  defp validate_android_apk_identity(apk, bundle_id, runner)
+       when is_binary(apk) and is_function(runner, 2) do
+    if File.regular?(apk) do
+      case invoke_command(runner, "apkanalyzer", ["manifest", "application-id", apk]) do
+        {:ok, output, 0}
+        when byte_size(output) <= @max_adb_install_result_bytes ->
+          lines =
+            if String.valid?(output) do
+              output
+              |> String.split("\n", trim: true)
+              |> Enum.map(&String.trim/1)
+              |> Enum.reject(&(&1 == ""))
+            else
+              []
+            end
+
+          if lines == [bundle_id] do
+            :ok
+          else
+            {:error, "Android APK application id does not match configured bundle id"}
+          end
+
+        _failure_or_malformed ->
+          {:error, "Could not verify Android APK application id; refusing update"}
+      end
+    else
+      {:error, "Android APK is missing; refusing update"}
+    end
+  end
+
+  defp validate_android_apk_identity(_apk, _bundle_id, _runner),
+    do: {:error, "Android APK path is invalid; refusing update"}
+
+  defp validate_android_apk_runtime(apk, selections, payload_plan) do
+    with {:ok, helper_sources} <- android_apk_helper_sources(selections),
+         {:ok, payload_entries} <- android_payload_apk_entries(payload_plan, selections),
+         {:ok, entries} <- android_apk_entries(apk),
+         :ok <-
+           validate_required_android_apk_entries(
+             entries,
+             Map.keys(helper_sources) ++ payload_entries
+           ),
+         :ok <- validate_android_apk_helper_content(apk, entries, helper_sources) do
+      :ok
+    end
+  end
+
+  defp android_apk_helper_sources(selections) when is_map(selections) do
+    selections
+    |> Map.values()
+    |> Enum.uniq_by(& &1.abi)
+    |> Enum.reduce_while({:ok, %{}}, fn %{abi: abi, otp_dir: otp_dir}, {:ok, sources} ->
+      case Path.wildcard(Path.join(otp_dir, "erts-*/bin")) do
+        [erts_bin] ->
+          case validate_android_erts_helpers(erts_bin) do
+            :ok ->
+              next =
+                Enum.reduce(@android_erts_helpers, sources, fn {source, packaged}, acc ->
+                  Map.put(
+                    acc,
+                    "lib/#{abi}/#{packaged}",
+                    Path.join(erts_bin, source)
+                  )
+                end)
+
+              {:cont, {:ok, next}}
+
+            {:error, _reason} = error ->
+              {:halt, error}
+          end
+
+        _missing_or_ambiguous ->
+          {:halt, {:error, "Android ERTS helper source is missing or ambiguous"}}
+      end
+    end)
+  end
+
+  defp android_payload_apk_entries(nil, _selections), do: {:ok, []}
+
+  defp android_payload_apk_entries(%{exqlite: nil}, _selections), do: {:ok, []}
+
+  defp android_payload_apk_entries(
+         %{
+           exqlite: %{
+             nif: %{
+               filename: "libsqlite3_nif.so",
+               selected_abis: plan_abis,
+               required_apk_entries: entries
+             }
+           }
+         },
+         selections
+       ) do
+    selected_abis = selected_android_abis(selections)
+    expected = Map.new(selected_abis, &{&1, "lib/#{&1}/libsqlite3_nif.so"})
+
+    if plan_abis == selected_abis and entries == expected do
+      {:ok, expected |> Map.values() |> Enum.sort()}
+    else
+      {:error, "Android payload APK requirements do not match selected ABIs"}
+    end
+  end
+
+  defp android_payload_apk_entries(_invalid, _selections),
+    do: {:error, "Android payload APK requirements are invalid"}
+
+  defp android_apk_entries(apk) do
+    with {:ok, %{size: size}} when size > 0 and size <= @max_android_apk_bytes <-
+           File.stat(apk),
+         {:ok, zip_entries} <- :zip.list_dir(String.to_charlist(apk)),
+         true <- length(zip_entries) <= @max_android_apk_entries do
+      Enum.reduce_while(zip_entries, {:ok, []}, fn
+        {:zip_comment, _comment}, {:ok, entries} ->
+          {:cont, {:ok, entries}}
+
+        {:zip_file, name, file_info, _comment, _offset, _compressed_size}, {:ok, entries} ->
+          with {:ok, normalized} <- normalize_android_apk_entry_name(name),
+               {:ok, uncompressed_size} <- android_zip_entry_size(file_info) do
+            {:cont, {:ok, [{normalized, uncompressed_size} | entries]}}
+          else
+            {:error, _reason} = error -> {:halt, error}
+          end
+
+        _invalid, _acc ->
+          {:halt, {:error, "Android APK ZIP directory is malformed"}}
+      end)
+    else
+      false -> {:error, "Android APK ZIP directory exceeds the safety limit"}
+      {:ok, %{size: _invalid}} -> {:error, "Android APK size is invalid"}
+      _failure -> {:error, "Could not inspect Android APK ZIP directory"}
+    end
+  end
+
+  defp normalize_android_apk_entry_name(name) when is_list(name) do
+    try do
+      normalized = List.to_string(name)
+
+      if byte_size(normalized) > 0 and byte_size(normalized) <= @max_android_apk_entry_bytes and
+           String.valid?(normalized) do
+        {:ok, normalized}
+      else
+        {:error, "Android APK ZIP entry name is invalid"}
+      end
+    rescue
+      _error -> {:error, "Android APK ZIP entry name is invalid"}
+    end
+  end
+
+  defp normalize_android_apk_entry_name(_invalid),
+    do: {:error, "Android APK ZIP entry name is invalid"}
+
+  defp android_zip_entry_size(file_info)
+       when is_tuple(file_info) and tuple_size(file_info) > 1 and
+              elem(file_info, 0) == :file_info and is_integer(elem(file_info, 1)) and
+              elem(file_info, 1) >= 0 and
+              elem(file_info, 1) <= @max_android_apk_required_entry_bytes,
+       do: {:ok, elem(file_info, 1)}
+
+  defp android_zip_entry_size(_invalid),
+    do: {:error, "Android APK ZIP entry size is invalid"}
+
+  defp validate_required_android_apk_entries(entries, required) do
+    frequencies = Enum.frequencies_by(entries, &elem(&1, 0))
+
+    if Enum.all?(required, &(Map.get(frequencies, &1) == 1)) do
+      :ok
+    else
+      {:error, "Android APK is missing an exact selected-ABI runtime entry"}
+    end
+  end
+
+  defp validate_android_apk_helper_content(apk, entries, helper_sources) do
+    required_names = Map.keys(helper_sources) |> Enum.sort()
+    sizes = Map.new(entries)
+
+    with true <- Enum.all?(required_names, &(Map.fetch!(sizes, &1) > 0)),
+         {:ok, extracted} <-
+           :zip.extract(
+             String.to_charlist(apk),
+             [:memory, {:file_list, Enum.map(required_names, &String.to_charlist/1)}]
+           ),
+         true <- length(extracted) == length(required_names) do
+      extracted
+      |> Enum.reduce_while(:ok, fn {entry_name, bytes}, :ok ->
+        with {:ok, normalized} <- normalize_android_apk_entry_name(entry_name),
+             source when is_binary(source) <- Map.fetch!(helper_sources, normalized),
+             {:ok, source_bytes} <- File.read(source),
+             true <-
+               byte_size(bytes) == byte_size(source_bytes) and
+                 :crypto.hash(:sha256, bytes) == :crypto.hash(:sha256, source_bytes) do
+          {:cont, :ok}
+        else
+          _mismatch -> {:halt, {:error, "Android APK ERTS helper provenance mismatch"}}
+        end
+      end)
+    else
+      _missing_or_invalid -> {:error, "Android APK ERTS helper provenance mismatch"}
+    end
+  end
+
+  defp selected_android_abis(selections) do
+    selections
+    |> Map.values()
+    |> Enum.map(& &1.abi)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp select_android_otp_sources(serials, otp_arm64, otp_arm32, otp_x86_64, runner) do
+    Enum.reduce_while(serials, {:ok, %{}}, fn serial, {:ok, selections} ->
+      case device_otp_selection(serial, otp_arm64, otp_arm32, otp_x86_64, runner) do
+        {:ok, selection} -> {:cont, {:ok, Map.put(selections, serial, selection)}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp prepare_selected_otp_archives(selections, app_data, elixir_lib, opts) do
+    otp_dirs =
+      selections
+      |> Map.values()
+      |> Enum.map(& &1.otp_dir)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    multiple? = length(otp_dirs) > 1
+
+    Enum.reduce_while(otp_dirs, {:ok, %{}}, fn otp_dir, {:ok, prepared} ->
+      archive_opts =
+        opts
+        |> Keyword.take([:attempt_id, :tmp_root, :otp_runner])
+        |> then(fn archive_opts ->
+          if multiple?, do: Keyword.delete(archive_opts, :attempt_id), else: archive_opts
+        end)
+        |> Keyword.put(:runner, Keyword.get(opts, :otp_runner, &run_system_command/3))
+
+      case prepare_otp_archive(app_data, otp_dir, elixir_lib, archive_opts) do
+        {:ok, plan} ->
+          selected_abis =
+            selections
+            |> Map.values()
+            |> Enum.filter(&(&1.otp_dir == otp_dir))
+            |> Enum.map(& &1.abi)
+            |> Enum.uniq()
+            |> Enum.sort()
+
+          plan =
+            plan
+            |> Map.put(:otp_dir, otp_dir)
+            |> Map.put(:selected_abis, selected_abis)
+
+          {:cont, {:ok, Map.put(prepared, otp_dir, plan)}}
+
+        {:error, _reason} = error ->
+          cleanup_prepared_otp_archives(prepared)
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp cleanup_prepared_otp_archives(prepared) do
+    Enum.each(prepared, fn
+      {_otp_dir, %{archive: %{path: path}}} when is_binary(path) -> File.rm(path)
+      _invalid -> :ok
+    end)
+  end
+
+  defp validate_android_native_otp_plan(prepared, selections, app_data)
+       when is_map(prepared) and is_map(selections) do
+    expected_dirs =
+      selections
+      |> Map.values()
+      |> Enum.map(& &1.otp_dir)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    paths =
+      Enum.flat_map(prepared, fn {_otp_dir, plan} ->
+        [plan.archive.path, plan.stage_device, plan.app_stage, plan.app_backup]
+      end)
+
+    with true <- Enum.sort(Map.keys(prepared)) == expected_dirs,
+         true <- Enum.uniq(paths) == paths,
+         true <-
+           Enum.all?(prepared, fn {otp_dir, plan} ->
+             expected_abis =
+               selections
+               |> Map.values()
+               |> Enum.filter(&(&1.otp_dir == otp_dir))
+               |> Enum.map(& &1.abi)
+               |> Enum.uniq()
+               |> Enum.sort()
+
+             validate_android_native_otp_entry(plan, otp_dir, expected_abis, app_data) == :ok
+           end) do
+      :ok
+    else
+      _invalid -> {:error, "Authoritative Android OTP archive plan is invalid"}
+    end
+  end
+
+  defp validate_android_native_otp_plan(_prepared, _selections, _app_data),
+    do: {:error, "Authoritative Android OTP archive plan is invalid"}
+
+  defp validate_android_native_otp_entry(plan, otp_dir, expected_abis, app_data)
+       when is_map(plan) do
+    with true <-
+           exact_map_keys?(plan, [
+             :activation_lock,
+             :app_backup,
+             :app_stage,
+             :archive,
+             :attempt_id,
+             :otp_dir,
+             :selected_abis,
+             :sentinels,
+             :stage_device
+           ]),
+         true <- plan.otp_dir == otp_dir,
+         true <- plan.selected_abis == expected_abis and expected_abis != [],
+         true <- valid_android_attempt_id?(plan.attempt_id),
+         :ok <- validate_android_local_file_identity(plan.archive, @max_android_apk_bytes),
+         true <- plan.stage_device == "/data/local/tmp/mob_otp_#{plan.attempt_id}.tar",
+         true <- plan.app_stage == "#{app_data}/.mob_otp_stage_#{plan.attempt_id}",
+         true <- plan.app_backup == "#{app_data}/.mob_otp_backup_#{plan.attempt_id}",
+         true <- plan.activation_lock == "#{app_data}/.mob_otp_activation_lock",
+         true <- valid_android_runtime_sentinels?(plan.sentinels) do
+      :ok
+    else
+      _invalid -> {:error, :invalid_native_otp_entry}
+    end
+  end
+
+  defp validate_android_native_otp_entry(_plan, _otp_dir, _expected_abis, _app_data),
+    do: {:error, :invalid_native_otp_entry}
+
+  defp verify_android_prepared_otp_archive(plan, otp_dir, expected_abi) do
+    with true <- plan.otp_dir == otp_dir,
+         true <- expected_abi in plan.selected_abis,
+         :ok <- validate_android_local_file_identity(plan.archive, @max_android_apk_bytes) do
+      :ok
+    else
+      _invalid -> {:error, "Exact Android OTP archive changed; refusing update"}
+    end
+  end
+
+  defp valid_android_runtime_sentinels?(sentinels)
+       when is_list(sentinels) and sentinels != [] and length(sentinels) <= 32 do
+    Enum.uniq(sentinels) == sentinels and
+      Enum.all?(sentinels, fn sentinel ->
+        is_binary(sentinel) and byte_size(sentinel) in 1..1_024 and String.valid?(sentinel) and
+          Path.type(sentinel) == :relative and String.starts_with?(sentinel, "otp/") and
+          not Enum.member?(Path.split(sentinel), "..") and
+          Regex.match?(Regex.compile!("\\A[A-Za-z0-9_./-]+\\z"), sentinel)
+      end)
+  end
+
+  defp valid_android_runtime_sentinels?(_sentinels), do: false
+
+  defp acquire_android_deploy_lock(serials, bundle_id, runner, opts) do
+    lock_opts =
+      case Keyword.fetch(opts, :lock_owner) do
+        {:ok, owner} -> [owner: owner]
+        :error -> []
+      end
+
+    case AndroidDeployLock.acquire(
+           bundle_id,
+           serials,
+           android_lock_runner(runner),
+           lock_opts
+         ) do
+      {:ok, lease} ->
+        {:ok, lease}
+
+      {:error, %{lease: %{state: :not_acquired}} = failure} ->
+        {:error, AndroidDeployLock.message(failure)}
+
+      {:error, %{lease: lease} = failure} ->
+        {:error, AndroidDeployLock.message(failure), lease}
+    end
+  end
+
+  defp transition_android_deploy_lock(lock, expected_phase, next_phase, runner) do
+    case AndroidDeployLock.transition(
+           lock,
+           expected_phase,
+           next_phase,
+           android_lock_runner(runner)
+         ) do
+      {:ok, transitioned} ->
+        {:ok, transitioned}
+
+      {:error, %{lease: lease} = failure} ->
+        {:error, AndroidDeployLock.message(failure), lease}
+    end
+  end
+
+  defp android_lock_runner(runner) do
+    fn args ->
+      case invoke_command(runner, "adb", args) do
+        {:ok, output, status} -> {output, status}
+        {:error, _reason} -> {"", 255}
+      end
+    end
+  end
+
+  @doc false
+  @spec release_android_deploy_lock(map(), keyword()) :: :ok | {:error, String.t()}
+  def release_android_deploy_lock(lock_info, opts \\ []) do
+    runner = Keyword.get(opts, :probe_runner, &run_system_command/2)
+
+    case AndroidDeployLock.release(lock_info, android_lock_runner(runner)) do
+      :ok -> :ok
+      {:error, failure} -> {:error, AndroidDeployLock.message(failure)}
+    end
+  end
+
+  defp preflight_installed_android_targets(serials, bundle_id, runner) do
+    Enum.reduce_while(serials, :ok, fn serial, :ok ->
+      case ensure_android_package_for_otp(runner, serial, bundle_id) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  @doc false
+  @spec interpret_adb_update(String.t(), integer()) ::
+          :updated | {:failed, android_update_failure_reason()}
+  def interpret_adb_update(output, exit_code)
+      when is_binary(output) and is_integer(exit_code) and
+             byte_size(output) <= @max_adb_install_result_bytes do
+    if String.valid?(output) do
+      case known_adb_failure(output) do
+        nil -> interpret_adb_update_status(output, exit_code)
+        reason -> {:failed, reason}
+      end
+    else
+      {:failed, :unknown_failure}
+    end
+  end
+
+  def interpret_adb_update(_output, _exit_code), do: {:failed, :unknown_failure}
+
+  defp android_update_targets(device_id) do
+    case resolve_android_update_targets(device_id) do
+      {:ok, serials} -> {:ok, serials}
+      {:error, reason} -> {:error, android_target_error(device_id, reason)}
+    end
+  end
+
+  defp resolve_adb_targets(output, nil) do
+    with {:ok, states} <- parse_adb_device_states(output) do
+      case Enum.find(states, fn {_serial, state} -> state != "device" end) do
+        {_serial, "offline"} -> {:error, :offline}
+        {_serial, "unauthorized"} -> {:error, :unauthorized}
+        {_serial, _state} -> {:error, :unknown_state}
+        nil -> ready_android_targets(states)
+      end
+    end
+  end
+
+  defp resolve_adb_targets(output, device_id) do
+    with {:ok, states} <- parse_adb_device_states(output) do
+      matches =
+        Enum.filter(states, fn {serial, _state} -> matching_adb_serial?(serial, device_id) end)
+
+      case matches do
+        [{serial, "device"}] -> {:ok, [serial]}
+        [{_serial, "offline"}] -> {:error, :offline}
+        [{_serial, "unauthorized"}] -> {:error, :unauthorized}
+        [{_serial, _state}] -> {:error, :unknown_state}
+        [] -> {:error, :target_not_connected}
+        _ -> {:error, :ambiguous_target}
+      end
+    end
+  end
+
+  defp ready_android_targets([]), do: {:error, :no_targets}
+
+  defp ready_android_targets(states) do
+    serials =
+      states
+      |> Enum.map(fn {serial, "device"} -> serial end)
+      |> Enum.sort()
+
+    {:ok, serials}
+  end
+
+  defp parse_adb_device_states(output)
+       when is_binary(output) and byte_size(output) > @max_adb_discovery_bytes,
+       do: {:error, :discovery_output_too_large}
+
+  defp parse_adb_device_states(output) when is_binary(output) do
+    if String.valid?(output) do
+      lines =
+        output
+        |> String.split("\n")
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+
+      with {:ok, rows} <- adb_device_rows(lines),
+           {:ok, states} <- parse_adb_device_rows(rows),
+           :ok <- validate_adb_device_states(states) do
+        {:ok, states}
+      end
+    else
+      {:error, :malformed_discovery}
+    end
+  end
+
+  defp parse_adb_device_states(_output), do: {:error, :malformed_discovery}
+
+  defp adb_device_rows(lines) do
+    {_notices, after_notices} = Enum.split_while(lines, &adb_daemon_notice?/1)
+
+    case after_notices do
+      ["List of devices attached" | rows] -> {:ok, rows}
+      _ -> {:error, :malformed_discovery}
+    end
+  end
+
+  defp adb_daemon_notice?(line), do: String.starts_with?(line, "* daemon ")
+
+  defp parse_adb_device_rows(rows) do
+    result =
+      Enum.reduce_while(rows, [], fn row, states ->
+        case String.split(row) do
+          [serial, state] ->
+            if valid_adb_serial?(serial) do
+              {:cont, [{serial, state} | states]}
+            else
+              {:halt, :error}
+            end
+
+          _ ->
+            {:halt, :error}
+        end
+      end)
+
+    case result do
+      :error -> {:error, :malformed_discovery}
+      states -> {:ok, Enum.reverse(states)}
+    end
+  end
+
+  defp validate_adb_device_states(states) do
+    serials = Enum.map(states, &elem(&1, 0))
+
+    cond do
+      Enum.uniq(serials) != serials -> {:error, :duplicate_target}
+      casefold_duplicates?(serials) -> {:error, :ambiguous_target}
+      length(states) > @max_android_update_targets -> {:error, :too_many_targets}
+      true -> :ok
+    end
+  end
+
+  defp validate_android_update_serials(serials) do
+    cond do
+      Enum.any?(serials, &(not valid_adb_serial?(&1))) -> {:error, :invalid_target}
+      Enum.uniq(serials) != serials -> {:error, :duplicate_target}
+      casefold_duplicates?(serials) -> {:error, :ambiguous_target}
+      true -> :ok
+    end
+  end
+
+  defp canonical_android_runtime_serials(serials) do
+    with {:ok, proper_serials} <-
+           collect_android_runtime_serials(serials, [], 0),
+         :ok <- validate_android_update_serials(proper_serials) do
+      {:ok, Enum.sort(proper_serials)}
+    else
+      {:error, reason} -> {:error, android_update_request_error(reason)}
+    end
+  end
+
+  defp collect_android_runtime_serials([], [], 0), do: {:error, :no_explicit_targets}
+  defp collect_android_runtime_serials([], serials, _count), do: {:ok, Enum.reverse(serials)}
+
+  defp collect_android_runtime_serials([_serial | _rest], _serials, @max_android_update_targets),
+    do: {:error, :too_many_targets}
+
+  defp collect_android_runtime_serials([serial | rest], serials, count),
+    do: collect_android_runtime_serials(rest, [serial | serials], count + 1)
+
+  defp collect_android_runtime_serials(_improper_or_invalid, _serials, _count),
+    do: {:error, :invalid_target}
+
+  defp casefold_duplicates?(serials) do
+    normalized = Enum.map(serials, &String.downcase/1)
+    Enum.uniq(normalized) != normalized
+  end
+
+  defp matching_adb_serial?(serial, device_id) do
+    serial == device_id or serial == "#{device_id}:5555" or strip_port(serial) == device_id
+  end
+
+  defp install_android_update(apk, serial, runner) do
+    if valid_adb_serial?(serial) do
+      IO.puts("  Updating APK on #{serial} (preserving app data)...")
+
+      result =
+        case invoke_command(runner, "adb", ["-s", serial, "install", "-r", apk]) do
+          {:ok, output, exit_code} -> interpret_adb_update(output, exit_code)
+          {:error, _reason} -> {:failed, :unknown_failure}
+        end
+
+      case result do
+        :updated ->
+          {:ok, serial}
+
+        {:failed, reason} ->
+          IO.puts(
+            "  #{IO.ANSI.yellow()}⚠  #{serial}: APK update failed " <>
+              "(#{android_update_reason(reason)}); app data preserved#{IO.ANSI.reset()}"
+          )
+
+          {:error, %{serial: serial, reason: reason}}
+      end
+    else
+      {:error, %{serial: bounded_serial_label(serial), reason: :invalid_target}}
+    end
+  end
+
+  defp interpret_adb_update_status(output, 0) do
+    lines =
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    allowed = ["Performing Streamed Install", "Performing Incremental Install"]
+
+    case Enum.reverse(lines) do
+      ["Success" | preceding] ->
+        if Enum.all?(preceding, &(&1 in allowed)),
+          do: :updated,
+          else: {:failed, :suspicious_success}
+
+      _ ->
+        {:failed, :suspicious_success}
+    end
+  end
+
+  defp interpret_adb_update_status(_output, _exit_code), do: {:failed, :unknown_failure}
+
+  defp known_adb_failure(output) do
+    lower = String.downcase(output)
+
+    cond do
+      String.contains?(output, "INSTALL_FAILED_INSUFFICIENT_STORAGE") ->
+        :insufficient_storage
+
+      String.contains?(output, "INSTALL_FAILED_UPDATE_INCOMPATIBLE") or
+        String.contains?(output, "INSTALL_PARSE_FAILED_INCONSISTENT_CERTIFICATES") or
+          String.contains?(output, "INSTALL_FAILED_SHARED_USER_INCOMPATIBLE") ->
+        :signature_mismatch
+
+      String.contains?(output, "INSTALL_FAILED_VERSION_DOWNGRADE") ->
+        :version_downgrade
+
+      String.contains?(lower, "unauthorized") ->
+        :unauthorized
+
+      String.contains?(lower, "device offline") or String.contains?(lower, "offline") ->
+        :offline
+
+      String.contains?(lower, "no devices/emulators found") or
+          String.contains?(lower, "device not found") ->
+        :unavailable
+
+      String.contains?(output, "INSTALL_FAILED_") or
+          String.contains?(output, "INSTALL_PARSE_FAILED_") ->
+        :install_rejected
+
+      true ->
+        nil
+    end
+  end
+
+  defp definite_android_install_rejection?(reason),
+    do:
+      reason in [
+        :insufficient_storage,
+        :signature_mismatch,
+        :version_downgrade,
+        :install_rejected
+      ]
+
+  defp android_target_error(nil, :no_targets), do: "No connected Android update targets found"
+
+  defp android_target_error(nil, reason) do
+    "Connected Android update targets are #{android_update_reason(reason)}"
+  end
+
+  defp android_target_error(device_id, reason) do
+    "Android update target #{bounded_serial_label(device_id)} is " <>
+      android_update_reason(reason)
+  end
+
+  defp android_update_request_error(:no_explicit_targets),
+    do: "Android APK update requires at least one explicit target"
+
+  defp android_update_request_error(:too_many_targets),
+    do: "Android APK update target count exceeds the safety limit"
+
+  defp android_update_request_error(:authoritative_transaction_required),
+    do: "Android APK updates require the authoritative payload transaction"
+
+  defp android_update_request_error(_reason), do: "Android APK update request is invalid"
+
+  defp android_update_reason(:device_discovery_failed), do: "not discoverable"
+  defp android_update_reason(:discovery_output_too_large), do: "too large to validate safely"
+  defp android_update_reason(:malformed_discovery), do: "malformed"
+  defp android_update_reason(:duplicate_target), do: "duplicated"
+  defp android_update_reason(:too_many_targets), do: "over the target safety limit"
+  defp android_update_reason(:target_not_connected), do: "not connected"
+  defp android_update_reason(:ambiguous_target), do: "ambiguous"
+  defp android_update_reason(:unknown_state), do: "in an unknown adb state"
+  defp android_update_reason(:insufficient_storage), do: "out of storage"
+  defp android_update_reason(:signature_mismatch), do: "signed by a different key"
+  defp android_update_reason(:version_downgrade), do: "a version downgrade"
+  defp android_update_reason(:offline), do: "offline"
+  defp android_update_reason(:unauthorized), do: "unauthorized"
+  defp android_update_reason(:unavailable), do: "unavailable"
+  defp android_update_reason(:install_rejected), do: "rejected by Android"
+  defp android_update_reason(:suspicious_success), do: "an unverified adb success"
+  defp android_update_reason(:unknown_failure), do: "an unknown adb failure"
+  defp android_update_reason(:invalid_target), do: "an invalid target"
+
+  defp bounded_serial_label(serial) when is_binary(serial) do
+    if valid_adb_serial?(serial), do: serial, else: "<invalid>"
+  end
+
+  defp bounded_serial_label(_serial), do: "<invalid>"
+
+  defp valid_adb_serial?(serial) when is_binary(serial) do
+    byte_size(serial) in 1..@max_adb_serial_bytes and not String.starts_with?(serial, "-") and
+      serial
+      |> :binary.bin_to_list()
+      |> Enum.all?(fn byte ->
+        byte in ?0..?9 or byte in ?A..?Z or byte in ?a..?z or byte in ~c".:-_"
+      end)
+  end
+
+  defp valid_adb_serial?(_serial), do: false
+
+  defp invoke_command(runner, executable, args) do
+    case runner.(executable, args) do
+      {output, exit_code} when is_binary(output) and is_integer(exit_code) ->
+        {:ok, output, exit_code}
+
+      _ ->
+        {:error, :invalid_command_result}
+    end
+  end
+
+  defp run_system_command(executable, args) do
+    case System.find_executable(executable) do
+      nil -> {"", 127}
+      path -> System.cmd(path, args, stderr_to_stdout: true)
+    end
+  end
+
+  defp run_system_command(executable, args, opts) do
+    case System.find_executable(executable) do
+      nil -> {"", 127}
+      path -> System.cmd(path, args, Keyword.put_new(opts, :stderr_to_stdout, true))
+    end
+  end
+
+  @doc false
+  @deprecated "OTP mutation is only supported by install_and_deliver_android_runtime/8"
+  @spec deliver_android_otp_release(
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) :: :ok | {:error, String.t()}
+  def deliver_android_otp_release(
+        _serial,
+        _bundle_id,
+        _elixir_lib,
+        _otp_arm64,
+        _otp_arm32,
+        _otp_x86_64,
+        _opts \\ []
+      ),
+      do: {:error, "Android OTP delivery requires the authoritative payload transaction"}
+
+  defp preflight_android_otp_candidates(otp_arm64, otp_arm32, otp_x86_64, elixir_lib) do
+    [otp_arm64, otp_arm32, otp_x86_64]
+    |> Enum.reduce_while(:ok, fn otp_dir, :ok ->
+      case android_runtime_sentinels(otp_dir, elixir_lib) do
+        {:ok, _sentinels} -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp device_otp_selection(serial, otp_arm64, otp_arm32, otp_x86_64, runner) do
+    probe =
+      invoke_command(runner, "adb", [
+        "-s",
+        serial,
+        "shell",
+        "getprop",
+        "ro.product.cpu.abi"
+      ])
+
+    with {:ok, abi} <- android_abi_from_probe(probe),
+         {:ok, otp_dir} <-
+           android_otp_dir_from_abi_probe(probe, otp_arm64, otp_arm32, otp_x86_64) do
+      {:ok, %{abi: abi, otp_dir: otp_dir}}
+    end
+  end
+
+  @doc false
+  @spec android_otp_dir_from_abi_probe(
+          term(),
+          String.t(),
+          String.t(),
+          String.t()
+        ) :: {:ok, String.t()} | {:error, String.t()}
+  def android_otp_dir_from_abi_probe({:ok, output, 0}, otp_arm64, otp_arm32, otp_x86_64)
+      when is_binary(output) and byte_size(output) <= 128 do
+    with {:ok, abi} <- android_abi_from_probe({:ok, output, 0}) do
+      case abi do
+        "arm64-v8a" -> {:ok, otp_arm64}
+        "armeabi-v7a" -> {:ok, otp_arm32}
+        "x86_64" -> {:ok, otp_x86_64}
+      end
+    end
+  end
+
+  def android_otp_dir_from_abi_probe({:ok, _output, status}, _arm64, _arm32, _x86_64)
+      when is_integer(status),
+      do: {:error, "Android ABI probe failed; refusing OTP delivery"}
+
+  def android_otp_dir_from_abi_probe(_probe, _arm64, _arm32, _x86_64),
+    do: {:error, "Invalid Android ABI probe result; refusing OTP delivery"}
+
+  defp android_abi_from_probe({:ok, output, 0})
+       when is_binary(output) and byte_size(output) <= 128 do
+    if String.valid?(output) do
+      case String.trim(output) do
+        abi when abi in ["arm64-v8a", "armeabi-v7a", "x86_64"] -> {:ok, abi}
+        _unsupported -> {:error, "Unsupported or missing Android ABI; refusing OTP delivery"}
+      end
+    else
+      {:error, "Invalid Android ABI probe output; refusing OTP delivery"}
+    end
+  end
+
+  defp android_abi_from_probe({:ok, _output, status}) when is_integer(status),
+    do: {:error, "Android ABI probe failed; refusing OTP delivery"}
+
+  defp android_abi_from_probe(_probe),
+    do: {:error, "Invalid Android ABI probe result; refusing OTP delivery"}
 
   @doc "Returns the OTP directory for the given Android ABI string."
   @spec otp_dir_for_abi(String.t(), String.t(), String.t()) :: String.t()
   def otp_dir_for_abi("armeabi-v7a", _arm64, arm32), do: arm32
   def otp_dir_for_abi(_abi, arm64, _arm32), do: arm64
 
-  defp push_otp_to_device(serial, bundle_id, app_data, otp_dir, elixir_lib) do
-    adb = fn args -> System.cmd("adb", ["-s", serial | args], stderr_to_stdout: true) end
+  @doc "Returns the OTP directory for the given Android ABI string."
+  @spec otp_dir_for_abi(String.t(), String.t(), String.t(), String.t()) :: String.t()
+  def otp_dir_for_abi("armeabi-v7a", _arm64, arm32, _x86_64), do: arm32
+  def otp_dir_for_abi("x86_64", _arm64, _arm32, x86_64), do: x86_64
+  def otp_dir_for_abi(_abi, arm64, _arm32, _x86_64), do: arm64
 
-    {pm_out, _} = adb.(["shell", "pm", "list", "packages", bundle_id])
-
-    unless String.contains?(pm_out, "package:#{bundle_id}") do
-      IO.puts(
-        "  #{IO.ANSI.yellow()}⚠  #{serial}: #{bundle_id} not installed — skipping OTP push#{IO.ANSI.reset()}"
-      )
-
-      throw({:skip, serial})
-    end
-
-    # Launch briefly so the app creates its files directory, then stop.
-    adb.(["shell", "am", "start", "-n", "#{bundle_id}/.MainActivity"])
-    :timer.sleep(2000)
-    adb.(["shell", "am", "force-stop", bundle_id])
-    :timer.sleep(500)
-
-    case adb.(["root"]) do
-      {out, 0} ->
-        if out =~ "restarting" or out =~ "already running as root" do
-          :timer.sleep(1000)
-          push_otp_root(adb, app_data, otp_dir, elixir_lib)
+  defp ensure_android_package_for_otp(runner, serial, bundle_id) do
+    case invoke_command(runner, "adb", [
+           "-s",
+           serial,
+           "shell",
+           "pm",
+           "list",
+           "packages",
+           bundle_id
+         ]) do
+      {:ok, pm_out, 0} ->
+        if android_package_listed?(pm_out, bundle_id) do
+          :ok
         else
-          push_otp_runas(serial, bundle_id, app_data, otp_dir, elixir_lib)
+          {:error, "Updated Android app is not installed; refusing OTP delivery"}
         end
 
-      _ ->
-        push_otp_runas(serial, bundle_id, app_data, otp_dir, elixir_lib)
+      {:ok, output, _status} ->
+        {:error, android_command_error("verify installed Android app", output)}
+
+      {:error, _reason} ->
+        {:error, "verify installed Android app failed: invalid command result"}
     end
   end
 
-  defp push_otp_root(adb, app_data, otp_dir, elixir_lib) do
-    try do
-      adb.(["shell", "mkdir -p #{app_data}/otp"])
+  @doc false
+  @spec android_package_listed?(term(), String.t()) :: boolean()
+  def android_package_listed?(pm_out, bundle_id)
+      when is_binary(pm_out) and is_binary(bundle_id) do
+    valid_output? =
+      byte_size(pm_out) <= @max_adb_discovery_bytes and String.valid?(pm_out)
 
-      case adb.(["push", "#{otp_dir}/.", "#{app_data}/otp/"]) do
-        {_, 0} -> :ok
-        {out, _} -> throw({:error, "push OTP release failed: #{String.slice(out, -300, 300)}"})
-      end
-
-      adb.(["shell", "mkdir -p #{app_data}/otp/lib/elixir/ebin"])
-      adb.(["shell", "mkdir -p #{app_data}/otp/lib/logger/ebin"])
-      adb.(["shell", "mkdir -p #{app_data}/otp/lib/eex/ebin"])
-
-      case adb.(["push", "#{elixir_lib}/elixir/ebin/.", "#{app_data}/otp/lib/elixir/ebin/"]) do
-        {_, 0} -> :ok
-        {out, _} -> throw({:error, "push elixir failed: #{String.slice(out, -300, 300)}"})
-      end
-
-      case adb.(["push", "#{elixir_lib}/logger/ebin/.", "#{app_data}/otp/lib/logger/ebin/"]) do
-        {_, 0} -> :ok
-        {out, _} -> throw({:error, "push logger failed: #{String.slice(out, -300, 300)}"})
-      end
-
-      case adb.(["push", "#{elixir_lib}/eex/ebin/.", "#{app_data}/otp/lib/eex/ebin/"]) do
-        {_, 0} -> :ok
-        {out, _} -> throw({:error, "push eex failed: #{String.slice(out, -300, 300)}"})
-      end
-
-      # Fix ownership so the app can read its own files.
-      {uid_out, _} = adb.(["shell", "stat -c %u #{app_data}/.."])
-      uid = String.trim(uid_out)
-      if uid != "", do: adb.(["shell", "chown -R #{uid}:#{uid} #{app_data}"])
-
-      :ok
-    catch
-      {:error, reason} -> {:error, reason}
-    end
+    valid_output? and
+      Enum.any?(String.split(pm_out, "\n"), &(String.trim(&1) == "package:#{bundle_id}"))
   end
 
-  defp push_otp_runas(serial, bundle_id, app_data, otp_dir, elixir_lib) do
-    stage_local = Path.join(System.tmp_dir!(), "mob_otp_#{serial}.tar")
-    stage_device = "/data/local/tmp/mob_otp.tar"
+  def android_package_listed?(_pm_out, _bundle_id), do: false
 
-    try do
-      tmp = Path.join(System.tmp_dir!(), "mob_otp_stage_#{serial}")
-      File.rm_rf!(tmp)
+  @doc false
+  @deprecated "OTP mutation is only supported by install_and_deliver_android_runtime/8"
+  @spec push_otp_runas(
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) :: :ok | {:error, String.t()}
+  def push_otp_runas(
+        _serial,
+        _bundle_id,
+        _app_data,
+        _otp_dir,
+        _elixir_lib,
+        _opts \\ []
+      ),
+      do: {:error, "Android OTP delivery requires the authoritative payload transaction"}
+
+  defp prepare_otp_archive(app_data, otp_dir, elixir_lib, opts) do
+    runner = Keyword.get(opts, :runner, &run_system_command/3)
+    tmp_root = Keyword.get(opts, :tmp_root, System.tmp_dir!())
+
+    with {:ok, attempt_id} <- android_attempt_id(opts),
+         {:ok, sentinels} <- android_runtime_sentinels(otp_dir, elixir_lib) do
+      stage_local = Path.join(tmp_root, "mob_otp_#{attempt_id}.tar")
+      tmp = Path.join(tmp_root, "mob_otp_stage_#{attempt_id}")
       otp_tmp = Path.join(tmp, "otp")
-      File.mkdir_p!(otp_tmp)
 
-      System.cmd("cp", ["-r", "#{otp_dir}/.", otp_tmp], stderr_to_stdout: true)
+      local_result =
+        try do
+          File.rm(stage_local)
+          File.rm_rf!(tmp)
+          File.mkdir_p!(otp_tmp)
 
-      File.mkdir_p!(Path.join(otp_tmp, "lib/elixir/ebin"))
-      File.mkdir_p!(Path.join(otp_tmp, "lib/logger/ebin"))
-      File.mkdir_p!(Path.join(otp_tmp, "lib/eex/ebin"))
+          with :ok <-
+                 checked_command(runner, "stage OTP runtime", "cp", [
+                   "-r",
+                   "#{otp_dir}/.",
+                   otp_tmp
+                 ]),
+               :ok <- prepare_elixir_stage(otp_tmp),
+               :ok <-
+                 checked_command(runner, "stage Elixir runtime", "cp", [
+                   "-r",
+                   "#{elixir_lib}/elixir/ebin/.",
+                   Path.join(otp_tmp, "lib/elixir/ebin")
+                 ]),
+               :ok <-
+                 checked_command(runner, "stage Logger runtime", "cp", [
+                   "-r",
+                   "#{elixir_lib}/logger/ebin/.",
+                   Path.join(otp_tmp, "lib/logger/ebin")
+                 ]),
+               :ok <-
+                 checked_command(runner, "stage EEx runtime", "cp", [
+                   "-r",
+                   "#{elixir_lib}/eex/ebin/.",
+                   Path.join(otp_tmp, "lib/eex/ebin")
+                 ]),
+               :ok <-
+                 checked_command(
+                   runner,
+                   "create OTP archive",
+                   "tar",
+                   ["cf", stage_local, "-C", tmp, "otp"],
+                   env: [{"COPYFILE_DISABLE", "1"}]
+                 ),
+               {:ok, archive} <- freeze_android_otp_archive(stage_local) do
+            {:ok,
+             %{
+               archive: archive,
+               attempt_id: attempt_id,
+               stage_device: "/data/local/tmp/mob_otp_#{attempt_id}.tar",
+               app_stage: "#{app_data}/.mob_otp_stage_#{attempt_id}",
+               app_backup: "#{app_data}/.mob_otp_backup_#{attempt_id}",
+               activation_lock: "#{app_data}/.mob_otp_activation_lock",
+               sentinels: sentinels
+             }}
+          end
+        after
+          File.rm_rf(tmp)
+        end
 
-      System.cmd(
-        "cp",
-        ["-r", "#{elixir_lib}/elixir/ebin/.", Path.join(otp_tmp, "lib/elixir/ebin")],
-        stderr_to_stdout: true
-      )
+      case local_result do
+        {:ok, _prepared} = ok ->
+          ok
 
-      System.cmd(
-        "cp",
-        ["-r", "#{elixir_lib}/logger/ebin/.", Path.join(otp_tmp, "lib/logger/ebin")],
-        stderr_to_stdout: true
-      )
-
-      System.cmd("cp", ["-r", "#{elixir_lib}/eex/ebin/.", Path.join(otp_tmp, "lib/eex/ebin")],
-        stderr_to_stdout: true
-      )
-
-      # COPYFILE_DISABLE=1 prevents macOS from inserting ._<file> AppleDouble
-      # sidecars into the archive (Toybox tar on Android can't chown to macOS UID).
-      case System.cmd("tar", ["cf", stage_local, "-C", tmp, "otp"],
-             env: [{"COPYFILE_DISABLE", "1"}],
-             stderr_to_stdout: true
-           ) do
-        {_, 0} -> :ok
-        {out, _} -> throw({:error, "tar create failed: #{out}"})
+        {:error, _reason} = error ->
+          File.rm(stage_local)
+          error
       end
-
-      case System.cmd("adb", ["-s", serial, "push", stage_local, stage_device],
-             stderr_to_stdout: true
-           ) do
-        {_, 0} -> :ok
-        {out, _} -> throw({:error, "adb push failed: #{out}"})
-      end
-
-      # `2>/dev/null; true` — Toybox tar cannot chown files to macOS UID 501
-      # and exits 1, but extraction succeeds. Suppress errors and always succeed.
-      cmd =
-        "run-as #{bundle_id} mkdir -p #{app_data} && " <>
-          "run-as #{bundle_id} tar xf #{stage_device} -C #{app_data} 2>/dev/null; true"
-
-      case System.cmd("adb", ["-s", serial, "shell", cmd], stderr_to_stdout: true) do
-        {_, 0} -> :ok
-        {out, _} -> throw({:error, "run-as tar failed: #{out}"})
-      end
-
-      System.cmd("adb", ["-s", serial, "shell", "rm -f #{stage_device}"], stderr_to_stdout: true)
-      :ok
-    catch
-      {:error, reason} -> {:error, reason}
-    after
-      File.rm(stage_local)
-      File.rm_rf(Path.join(System.tmp_dir!(), "mob_otp_stage_#{serial}"))
     end
   end
 
-  defp parse_adb_serials(output) do
-    output
-    |> String.split("\n")
-    |> Enum.drop(1)
-    |> Enum.filter(&String.contains?(&1, "\tdevice"))
-    |> Enum.map(&hd(String.split(&1, "\t")))
+  defp freeze_android_otp_archive(path) do
+    with :ok <- File.chmod(path, 0o400),
+         {:ok, %{type: :regular, size: size, mode: mode}}
+         when size > 0 and size <= @max_android_apk_bytes and Bitwise.band(mode, 0o222) == 0 <-
+           File.stat(path),
+         {:ok, sha256} <- file_sha256(path) do
+      {:ok,
+       %{
+         path: path,
+         size: size,
+         sha256: Base.encode16(sha256, case: :lower)
+       }}
+    else
+      _failure -> {:error, "Could not freeze exact Android OTP archive"}
+    end
   end
+
+  defp deploy_prepared_otp(
+         runner,
+         owner_runner,
+         lock,
+         serial,
+         bundle_id,
+         app_data,
+         prepared
+       ) do
+    push_staged_otp(
+      runner,
+      owner_runner,
+      lock,
+      serial,
+      bundle_id,
+      app_data,
+      prepared.archive.path,
+      prepared.stage_device,
+      prepared.app_stage,
+      prepared.app_backup,
+      prepared.activation_lock,
+      prepared.sentinels
+    )
+  end
+
+  defp push_staged_otp(
+         runner,
+         owner_runner,
+         lock,
+         serial,
+         bundle_id,
+         app_data,
+         stage_local,
+         stage_device,
+         app_stage,
+         app_backup,
+         activation_lock,
+         sentinels
+       ) do
+    push_result =
+      checked_locked_android_command(
+        lock,
+        owner_runner,
+        runner,
+        serial,
+        "push OTP archive",
+        ["push", stage_local, stage_device]
+      )
+
+    case push_result do
+      :ok ->
+        deploy_result =
+          with :ok <-
+                 checked_locked_android_command(
+                   lock,
+                   owner_runner,
+                   runner,
+                   serial,
+                   "prepare app-private OTP staging directory",
+                   [
+                     "shell",
+                     "run-as #{bundle_id} sh -c 'test ! -e #{app_backup} && rm -rf #{app_stage} && mkdir -p #{app_stage}'"
+                   ]
+                 ),
+               :ok <-
+                 checked_locked_android_command(
+                   lock,
+                   owner_runner,
+                   runner,
+                   serial,
+                   "extract OTP archive",
+                   [
+                     "shell",
+                     "run-as #{bundle_id} tar xof #{stage_device} -C #{app_stage}"
+                   ]
+                 ),
+               :ok <-
+                 checked_command(runner, "verify staged OTP runtime", "adb", [
+                   "-s",
+                   serial,
+                   "shell",
+                   runtime_verification_command(bundle_id, app_stage, sentinels)
+                 ]),
+               :ok <-
+                 checked_locked_android_command(
+                   lock,
+                   owner_runner,
+                   runner,
+                   serial,
+                   "activate OTP runtime",
+                   [
+                     "shell",
+                     otp_activation_command(
+                       bundle_id,
+                       app_data,
+                       app_stage,
+                       app_backup,
+                       activation_lock,
+                       sentinels
+                     )
+                   ]
+                 ),
+               :ok <-
+                 checked_command(runner, "verify active OTP runtime", "adb", [
+                   "-s",
+                   serial,
+                   "shell",
+                   runtime_verification_command(bundle_id, app_data, sentinels)
+                 ]),
+               :ok <-
+                 checked_locked_android_command(
+                   lock,
+                   owner_runner,
+                   runner,
+                   serial,
+                   "release OTP activation lock",
+                   ["shell", activation_lock_release_command(bundle_id, activation_lock)]
+                 ),
+               :ok <-
+                 checked_locked_android_command(
+                   lock,
+                   owner_runner,
+                   runner,
+                   serial,
+                   "clean OTP activation backup",
+                   ["shell", activation_backup_cleanup_command(bundle_id, app_backup)]
+                 ) do
+            :ok
+          end
+
+        case deploy_result do
+          :ok ->
+            merge_deploy_and_cleanup_results(
+              :ok,
+              cleanup_android_otp_stage(
+                runner,
+                owner_runner,
+                lock,
+                serial,
+                bundle_id,
+                stage_device,
+                app_stage
+              )
+            )
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp prepare_elixir_stage(otp_tmp) do
+    for app <- ["elixir", "logger", "eex"] do
+      File.mkdir_p!(Path.join(otp_tmp, "lib/#{app}/ebin"))
+    end
+
+    :ok
+  end
+
+  defp android_runtime_sentinels(otp_dir, elixir_lib)
+       when is_binary(otp_dir) and is_binary(elixir_lib) do
+    erts_bin_dirs = Path.wildcard(Path.join(otp_dir, "erts-*/bin"))
+
+    kernel_sentinel = Path.join(elixir_lib, "elixir/ebin/Elixir.Kernel.beam")
+
+    with [erts_bin] <- erts_bin_dirs,
+         :ok <- validate_android_erts_helpers(erts_bin),
+         true <- File.regular?(kernel_sentinel),
+         {:ok, logger_sentinel} <- runtime_app_beam_sentinel(elixir_lib, "logger"),
+         {:ok, eex_sentinel} <- runtime_app_beam_sentinel(elixir_lib, "eex") do
+      relative_erts = Path.relative_to(Path.join(erts_bin, "erl_child_setup"), otp_dir)
+
+      if Regex.match?(Regex.compile!(@android_erts_sentinel_pattern), relative_erts) do
+        relative_erts_bin = Path.dirname(relative_erts)
+
+        {:ok,
+         [
+           Path.join("otp", relative_erts),
+           Path.join(["otp", relative_erts_bin, "inet_gethost"]),
+           Path.join(["otp", relative_erts_bin, "epmd"]),
+           "otp/lib/elixir/ebin/Elixir.Kernel.beam",
+           Path.join("otp/lib/logger/ebin", logger_sentinel),
+           Path.join("otp/lib/eex/ebin", eex_sentinel)
+         ]}
+      else
+        {:error, "Unsafe Android runtime sentinel; refusing OTP delivery"}
+      end
+    else
+      _ ->
+        {:error, "Android runtime sentinel missing or ambiguous; refusing OTP delivery"}
+    end
+  end
+
+  defp android_runtime_sentinels(_otp_dir, _elixir_lib),
+    do: {:error, "Android runtime source is invalid; refusing OTP delivery"}
+
+  defp runtime_app_beam_sentinel(elixir_lib, app) do
+    sentinels =
+      elixir_lib
+      |> Path.join("#{app}/ebin/*.beam")
+      |> Path.wildcard()
+      |> Enum.filter(&File.regular?/1)
+      |> Enum.map(&Path.basename/1)
+      |> Enum.filter(fn basename ->
+        byte_size(basename) <= 255 and String.valid?(basename) and
+          Regex.match?(Regex.compile!("\\A[A-Za-z0-9_.-]+\\.beam\\z"), basename)
+      end)
+      |> Enum.sort()
+
+    case sentinels do
+      [sentinel | _] -> {:ok, sentinel}
+      [] -> {:error, :missing_runtime_app_beam}
+    end
+  end
+
+  defp runtime_verification_command(bundle_id, app_data, sentinels) do
+    checks = Enum.map_join(sentinels, " && ", &"test -r #{Path.join(app_data, &1)}")
+    "run-as #{bundle_id} sh -c '#{checks}'"
+  end
+
+  defp otp_activation_command(
+         bundle_id,
+         app_data,
+         app_stage,
+         app_backup,
+         activation_lock,
+         sentinels
+       ) do
+    live_otp = Path.join(app_data, "otp")
+    staged_otp = Path.join(app_stage, "otp")
+    checks = Enum.map_join(sentinels, " && ", &"test -r #{Path.join(app_data, &1)}")
+
+    "run-as #{bundle_id} sh -c 'set -e; mkdir #{activation_lock}; had_live=0; " <>
+      "if [ -e #{live_otp} ]; then mv #{live_otp} #{app_backup}; had_live=1; fi; " <>
+      "if mv #{staged_otp} #{live_otp} && #{checks}; then " <>
+      ":; else rm -rf #{live_otp}; " <>
+      "if [ \"$had_live\" -eq 1 ]; then mv #{app_backup} #{live_otp}; fi; exit 1; fi'"
+  end
+
+  defp activation_lock_release_command(bundle_id, activation_lock),
+    do: "run-as #{bundle_id} rmdir #{activation_lock}"
+
+  defp activation_backup_cleanup_command(bundle_id, app_backup),
+    do: "run-as #{bundle_id} rm -rf #{app_backup}"
+
+  defp cleanup_android_otp_stage(
+         runner,
+         owner_runner,
+         lock,
+         serial,
+         bundle_id,
+         stage_device,
+         app_stage
+       ) do
+    cleanup_results = [
+      checked_locked_android_command(
+        lock,
+        owner_runner,
+        runner,
+        serial,
+        "clean app-private OTP staging directory",
+        ["shell", "run-as #{bundle_id} rm -rf #{app_stage}"]
+      ),
+      cleanup_remote_otp_archive(runner, owner_runner, lock, serial, stage_device)
+    ]
+
+    Enum.find(cleanup_results, :ok, &match?({:error, _reason}, &1))
+  end
+
+  defp cleanup_remote_otp_archive(runner, owner_runner, lock, serial, stage_device) do
+    checked_locked_android_command(
+      lock,
+      owner_runner,
+      runner,
+      serial,
+      "clean remote OTP archive",
+      ["shell", "rm -f #{stage_device}"]
+    )
+  end
+
+  defp checked_locked_android_command(
+         lock,
+         owner_runner,
+         runner,
+         serial,
+         operation,
+         args
+       ) do
+    with :ok <- verify_android_deploy_lock_set(lock, owner_runner) do
+      checked_command(runner, operation, "adb", ["-s", serial | args])
+    end
+  end
+
+  defp merge_deploy_and_cleanup_results(:ok, :ok), do: :ok
+
+  defp merge_deploy_and_cleanup_results(:ok, {:error, _reason} = cleanup_error),
+    do: cleanup_error
+
+  defp android_attempt_id(opts) do
+    attempt_id =
+      case Keyword.get(opts, :attempt_id) do
+        nil -> :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
+        attempt_id -> attempt_id
+      end
+
+    if is_binary(attempt_id) and String.valid?(attempt_id) and
+         Regex.match?(Regex.compile!(@android_attempt_id_pattern), attempt_id) do
+      {:ok, attempt_id}
+    else
+      {:error, "Invalid Android deploy attempt id; refusing OTP delivery"}
+    end
+  end
+
+  defp validate_android_bundle_id(bundle_id) when is_binary(bundle_id) do
+    if byte_size(bundle_id) <= 255 and String.valid?(bundle_id) and
+         Regex.match?(
+           Regex.compile!("\\A[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+\\z"),
+           bundle_id
+         ) do
+      :ok
+    else
+      {:error, "Invalid Android bundle id; refusing OTP delivery"}
+    end
+  end
+
+  defp validate_android_bundle_id(_bundle_id),
+    do: {:error, "Invalid Android bundle id; refusing OTP delivery"}
+
+  defp validate_android_app_data(app_data, bundle_id) do
+    if app_data == "/data/data/#{bundle_id}/files" do
+      :ok
+    else
+      {:error, "Invalid Android app-data path; refusing OTP delivery"}
+    end
+  end
+
+  defp checked_command(runner, operation, executable, args, opts \\ []) do
+    case runner.(executable, args, Keyword.put_new(opts, :stderr_to_stdout, true)) do
+      {output, 0}
+      when is_binary(output) and byte_size(output) <= @max_adb_discovery_bytes ->
+        if String.valid?(output),
+          do: :ok,
+          else: {:error, "#{operation} failed: invalid command output"}
+
+      {_output, 0} ->
+        {:error, "#{operation} failed: invalid command output"}
+
+      {output, _status} ->
+        {:error, android_command_error(operation, output)}
+
+      _other ->
+        {:error, "#{operation} failed: invalid command result"}
+    end
+  end
+
+  defp android_command_error(operation, _output), do: "#{operation} failed"
 
   # Filters a list of adb serials by `--device <id>`. The id is matched against
   # the serial directly, against an `IP:port` form (auto-strip `:5555`), and
@@ -1311,7 +4229,8 @@ defmodule MobDev.NativeBuild do
          {:ok, otp_root} <- MobDev.OtpDownloader.ensure_ios_sim(),
          {:ok, python_bundle} <- maybe_ensure_python_bundle(),
          {:ok, mlx_dir} <- maybe_ensure_mlx_dir(:ios_sim),
-         {:ok, nxeigen_archive} <- maybe_build_nxeigen(:ios_sim) do
+         {:ok, nxeigen_archive} <- maybe_build_nxeigen(:ios_sim),
+         {:ok, tflite_build} <- maybe_build_tflite(:ios_sim) do
       IO.puts("  Building iOS simulator app...")
 
       mob_dir = Path.expand(cfg[:mob_dir])
@@ -1319,6 +4238,7 @@ defmodule MobDev.NativeBuild do
       app_module = Mix.Project.config() |> Keyword.fetch!(:app) |> Atom.to_string()
       display_name = ios_display_name()
       erts_vsn = detect_erts_vsn(otp_root)
+      project_swift_sources = project_swift_sources_arg(cfg)
 
       with {:ok, sdkroot} <- xcrun_sdk_path("iphonesimulator"),
            :ok <- compile_elixir_for_ios(),
@@ -1347,13 +4267,21 @@ defmodule MobDev.NativeBuild do
                sdkroot,
                build_dir,
                display_name,
+               project_swift_sources,
                mlx_dir,
-               nxeigen_archive
+               nxeigen_archive,
+               tflite_build
              ),
            {:ok, sim_id} <- pick_ios_sim(device_id),
            binary_path = "ios/zig-out/#{display_name}",
            :ok <- check_path(binary_path, "iOS binary"),
            {:ok, app_path} <- bundle_ios_app(binary_path, display_name),
+           :ok <-
+             copy_tflite_frameworks_ios(
+               tflite_build,
+               "ios-arm64_x86_64-simulator",
+               Path.join(app_path, "Frameworks")
+             ),
            :ok <- install_ios_sim(sim_id, app_path) do
         {:ok, "iOS"}
       else
@@ -1929,15 +4857,22 @@ defmodule MobDev.NativeBuild do
   end
 
   defp copy_priv_repo_assets(otp_root, app_module) do
-    src = "priv/repo/migrations"
-
-    if File.dir?(src) do
-      IO.puts("  === Copying priv/repo assets")
-      dst = Path.join([otp_root, app_module, "priv/repo/migrations"])
+    # Copy the WHOLE priv/ into BEAMS_DIR/priv (not just repo/migrations), so
+    # Application.app_dir(:<app>, "priv/...") resolves on device/sim — e.g.
+    # priv/cacerts.pem (Mob.Certs.load_cacerts!), priv/mix + priv/hex ebins
+    # (on-device Mix.install), a vendored lib's priv/ (Livebook's static), etc.
+    # Mirrors the device release's full-priv rsync; without it the sim boot
+    # crashed at Mob.Certs.load_cacerts! with :enoent on priv/cacerts.pem.
+    if File.dir?("priv") do
+      IO.puts("  === Copying priv/ (full)")
+      dst = Path.join([otp_root, app_module, "priv"])
       File.mkdir_p!(dst)
+      chmod_writable(dst)
 
-      Path.wildcard("#{src}/*.exs")
-      |> Enum.each(&File.cp!(&1, Path.join(dst, Path.basename(&1))))
+      {_, status} =
+        System.cmd("rsync", ["-a", "--no-perms", "priv/", "#{dst}/"], stderr_to_stdout: true)
+
+      if status != 0, do: raise("rsync priv/ -> #{dst} failed")
     end
 
     :ok
@@ -1968,20 +4903,27 @@ defmodule MobDev.NativeBuild do
   end
 
   defp copy_eex_stdlib_to_app(elixir_lib, otp_root, app_module) do
-    # EEx is part of Elixir but mob_beam.m doesn't add it to the code path.
-    # Drop it into BEAMS_DIR (flat) so code:where_is_file("eex.app") resolves
-    # — Ecto's startup needs it.
-    IO.puts("  === Copying EEx stdlib")
+    # The iOS sim's mob_beam.m doesn't add lib/<app>/ebin to the code path, so
+    # the Elixir-distribution apps that copy_elixir_stdlib_to_otp drops under
+    # lib/ (elixir, logger) — plus eex — are invisible there: boot fails at
+    # `ensure_all_started(:elixir)` with "elixir.app not found". Drop their .app
+    # + beams into BEAMS_DIR (flat), which IS on the path, so they resolve.
+    # (eex was already needed for Ecto's startup; elixir/logger are needed for
+    # the sim to boot at all. Harmless on device, which also has them in lib/.)
+    IO.puts("  === Copying Elixir-distribution apps (elixir, logger, eex) to BEAMS_DIR")
     dst = Path.join(otp_root, app_module)
     File.mkdir_p!(dst)
-    src_ebin = Path.join([elixir_lib, "eex", "ebin"])
 
-    if File.dir?(src_ebin) do
-      Path.wildcard("#{src_ebin}/*.beam")
-      |> Enum.each(&File.cp!(&1, Path.join(dst, Path.basename(&1))))
+    for app <- ~w(elixir logger eex) do
+      src_ebin = Path.join([elixir_lib, app, "ebin"])
 
-      app_file = Path.join(src_ebin, "eex.app")
-      if File.exists?(app_file), do: File.cp!(app_file, Path.join(dst, "eex.app"))
+      if File.dir?(src_ebin) do
+        Path.wildcard("#{src_ebin}/*.beam")
+        |> Enum.each(&File.cp!(&1, Path.join(dst, Path.basename(&1))))
+
+        app_file = Path.join(src_ebin, "#{app}.app")
+        if File.exists?(app_file), do: File.cp!(app_file, Path.join(dst, "#{app}.app"))
+      end
     end
 
     :ok
@@ -2113,6 +5055,87 @@ defmodule MobDev.NativeBuild do
     end
   end
 
+  # Emits the iOS plugin bootstrap Swift file the build step later compiles
+  # alongside the project + plugin Swift sources. Returns the absolute path of
+  # the written file so the caller can append it to `plugin_swift_files`.
+  #
+  # The file is regenerated on every iOS build. The content is purely a
+  # function of the activated-plugin manifests, so this is cheap and keeps
+  # the build cache aligned with the manifest set (no stale registrations
+  # from a plugin that just got deactivated).
+  defp generate_ios_plugin_bootstrap(build_dir) do
+    out_path = Path.join(build_dir, "mob_plugin_bootstrap.swift")
+    source = MobDev.Plugin.IOSBootstrap.swift_source(MobDev.Plugin.activated())
+    File.write!(out_path, source)
+    out_path
+  end
+
+  @doc false
+  # Pure kernel: does an iOS build file (build.zig / build_device.zig) accept the
+  # `plugin_swift_files` option? Presence of that token means the app was
+  # scaffolded from a plugin-aware template — whose AppDelegate also always calls
+  # `mob_register_plugins()`. So even with zero plugins activated we must still
+  # feed it the (empty) bootstrap that defines that symbol, or the link fails
+  # with `undefined _mob_register_plugins` (MOB-7). Legacy scaffolds lack the
+  # token *and* never call the symbol, so they stay on the empty-flags path.
+  @spec build_file_supports_plugins?(String.t()) :: boolean()
+  def build_file_supports_plugins?(content), do: String.contains?(content, "plugin_swift_files")
+
+  @doc false
+  # Thin I/O wrapper around build_file_supports_plugins?/1. Missing/unreadable
+  # file ⇒ false (treat as legacy: omit the flags rather than risk an unknown
+  # -D option on an old build.zig). Public (@doc false) so the missing-file
+  # branch is testable.
+  @spec ios_build_file_supports_plugins?(String.t()) :: boolean()
+  def ios_build_file_supports_plugins?(path) do
+    case File.read(path) do
+      {:ok, content} -> build_file_supports_plugins?(content)
+      _ -> false
+    end
+  end
+
+  @doc false
+  # Pure decision — which iOS plugin-swift mode applies. Extracted from
+  # ios_plugin_swift_and_frameworks/3 so the MOB-7 branch (`:bootstrap_only` —
+  # no plugins, but a plugin-aware build file whose AppDelegate still calls
+  # mob_register_plugins) is unit-testable without file I/O or the plugin
+  # registry. A regression flipping that branch back to `:none` reintroduces
+  # MOB-7, so it must be pinned.
+  @spec ios_plugin_swift_mode([term()], boolean()) :: :with_plugins | :bootstrap_only | :none
+  def ios_plugin_swift_mode([], true), do: :bootstrap_only
+  def ios_plugin_swift_mode([], false), do: :none
+  def ios_plugin_swift_mode(_activated, _supports?), do: :with_plugins
+
+  # Resolves the {plugin_swift_files, plugin_frameworks} pair for an iOS build,
+  # shared by the sim and device paths. Activated plugins ⇒ their Swift + the
+  # bootstrap. No plugins but a plugin-aware build file ⇒ just the bootstrap (so
+  # mob_register_plugins is defined — see MOB-7). Otherwise empty (flags omitted).
+  defp ios_plugin_swift_and_frameworks(activated_plugins, build_dir, ios_build_file) do
+    # `and` short-circuits: with plugins activated we never read the build file,
+    # so the activated path is byte-identical to before this MOB-7 change.
+    supports? = activated_plugins == [] and ios_build_file_supports_plugins?(ios_build_file)
+
+    case ios_plugin_swift_mode(activated_plugins, supports?) do
+      :with_plugins ->
+        bootstrap_path = generate_ios_plugin_bootstrap(build_dir)
+
+        swift =
+          (MobDev.Plugin.Merge.swift_files(activated_plugins) ++ [bootstrap_path])
+          |> Enum.join(",")
+
+        frameworks =
+          activated_plugins |> MobDev.Plugin.Merge.ios_frameworks() |> Enum.join(",")
+
+        {swift, frameworks}
+
+      :bootstrap_only ->
+        {generate_ios_plugin_bootstrap(build_dir), ""}
+
+      :none ->
+        {"", ""}
+    end
+  end
+
   defp zig_build_binary_ios_sim(
          mob_dir,
          otp_root,
@@ -2120,10 +5143,48 @@ defmodule MobDev.NativeBuild do
          sdkroot,
          build_dir,
          display_name,
+         project_swift_sources,
          mlx_dir,
-         nxeigen_archive
+         nxeigen_archive,
+         tflite_build
        ) do
     driver_tab = resolve_driver_tab_ios(mob_dir)
+
+    # Plugin-contributed Swift sources + extra iOS frameworks gathered from
+    # activated plugin manifests. Empty strings when no plugin contributes,
+    # so the build.zig templates `orelse ""` and the flags are safe to emit
+    # unconditionally (mirrors the Android plugin_c_nifs pattern at the top
+    # of run_zig_android_objects).
+    activated_plugins = MobDev.Plugin.activated()
+
+    # Capability enforcement (see MOB_PLUGIN_SECURITY.md, Layer 2): refuse to
+    # link an activated plugin whose Swift source imports a framework — or
+    # whose AndroidManifest references a permission — its manifest doesn't
+    # declare. Raises with the full list of drifts when any are found.
+    MobDev.Plugin.Validator.raise_on_capability_drift!(activated_plugins)
+
+    # Generated bootstrap Swift gets compiled alongside the plugins' own Swift
+    # files via -Dplugin_swift_files. The bootstrap also defines
+    # mob_register_plugins(), which a plugin-aware AppDelegate always calls — so
+    # even a zero-plugin app on a current build.zig needs it (see MOB-7). Legacy
+    # scaffolds (no plugin_swift_files option, no call to the symbol) get empty
+    # flags, omitted below, keeping them building.
+    {plugin_swift_files, plugin_frameworks} =
+      ios_plugin_swift_and_frameworks(
+        activated_plugins,
+        build_dir,
+        Path.expand("ios/build.zig")
+      )
+
+    # Activated plugins' C NIF sources (tier-1 plugins). Mirrors the Android
+    # plugin_c_nifs path and the iOS project_c_nifs path: each .c is compiled +
+    # linked into the app so the plugin's <module>_nif_init symbol (referenced
+    # by the generated driver_tab_ios, which resolved_nifs/0 already populates)
+    # resolves at link time. Empty when no NIF-bearing plugin is activated.
+    # (zig plugin NIFs on iOS aren't wired yet — no current plugin needs one;
+    # bt's zig NIF was Android-only. Add a plugin_zig_nifs path here + in
+    # ios/build.zig if a future plugin ships an iOS zig NIF.)
+    plugin_c_nifs = MobDev.Plugin.Merge.nif_sources(activated_plugins, :ios) |> Enum.join(",")
 
     base_args = [
       "build",
@@ -2137,15 +5198,31 @@ defmodule MobDev.NativeBuild do
       "-Ddriver_tab=#{driver_tab}",
       "-Denif_keepalive=#{Path.join(build_dir, "enif_keepalive.c")}",
       "-Dproject_ios_dir=#{Path.expand("ios")}",
-      "-Dmodule_name=#{display_name}"
+      "-Dmodule_name=#{display_name}",
+      "-Dproject_swift_sources=#{project_swift_sources}"
     ]
 
-    with {:ok, nif_args} <- project_nif_zig_args(:ios_sim) do
+    # Omit -Dplugin_* when empty (no plugins) so apps on pre-plugin ios/build.zig
+    # don't choke on unknown options; a plugin-aware build.zig defaults them to "".
+    plugin_args =
+      for {name, val} <- [
+            {"plugin_swift_files", plugin_swift_files},
+            {"plugin_frameworks", plugin_frameworks},
+            {"plugin_c_nifs", plugin_c_nifs}
+          ],
+          val != "",
+          do: "-D#{name}=#{val}"
+
+    with {:ok, nif_args} <- project_nif_zig_args(:ios_sim),
+         {:ok, plugin_archives} <- build_plugin_static_archives(:ios_sim, :ios, otp_root) do
       args =
         base_args ++
+          plugin_args ++
           nif_args ++
           mlx_zig_args(mlx_dir) ++
-          nxeigen_zig_args_ios(nxeigen_archive)
+          nxeigen_zig_args_ios(nxeigen_archive) ++
+          tflite_zig_args_ios(tflite_build) ++
+          plugin_static_lib_args(plugin_archives)
 
       case System.cmd("zig", args, stderr_to_stdout: true, into: IO.stream()) do
         {_, 0} -> :ok
@@ -2187,11 +5264,31 @@ defmodule MobDev.NativeBuild do
   # isn't a dep, or a tagged-tuple error.
   defp maybe_build_nxeigen(target_id)
        when target_id in [:android_arm64, :android_arm32, :ios_sim, :ios_device] do
-    if nxeigen_in_project?() do
-      do_build_nxeigen(target_id)
-    else
-      {:ok, nil}
+    cond do
+      # An activated cpp_archive plugin (mob_nx_eigen) provides nx_eigen_nif_init
+      # itself, so the legacy core build must yield — otherwise both emit
+      # libnx_eigen*.a with the same symbol and the link fails on a duplicate.
+      # Lets the plugin path be device-verified before the core hooks are
+      # removed; the core path stays the fallback for apps not yet on the plugin.
+      nxeigen_provided_by_plugin?() ->
+        {:ok, nil}
+
+      nxeigen_in_project?() ->
+        do_build_nxeigen(target_id)
+
+      true ->
+        {:ok, nil}
     end
+  end
+
+  # True when an activated plugin contributes a cpp_archive NIF whose init symbol
+  # is nx_eigen's (`nx_eigen_nif_init`) — i.e. the plugin supersedes the core
+  # NxEigen build.
+  @doc false
+  @spec nxeigen_provided_by_plugin?() :: boolean()
+  def nxeigen_provided_by_plugin? do
+    MobDev.Plugin.Merge.static_archives(MobDev.Plugin.activated(), :all)
+    |> Enum.any?(&(&1[:nm_symbol] == "nx_eigen_nif_init"))
   end
 
   defp do_build_nxeigen(target_id) do
@@ -2283,6 +5380,306 @@ defmodule MobDev.NativeBuild do
 
   def nxeigen_zig_args_android(archive_path) when is_binary(archive_path) do
     ["-Dnxeigen_static=true", "-Dnxeigen_lib=#{archive_path}"]
+  end
+
+  # ── Generic plugin cpp_archive integration ─────────────────────────────────
+  # The plugin-system replacement for the bespoke nxeigen/tflite hooks above:
+  # activated plugins declare `lang: :cpp_archive` NIFs (MobDev.Plugin.Merge +
+  # CppArchive), each cross-compiled to lib<mod>.a and static-linked. One
+  # `-Dplugin_static_libs=<comma-paths>` flag carries them all to build.zig.
+
+  # The zig `-Dplugin_static_libs` flag for a list of built archive paths.
+  # Emitted only when non-empty so apps on a pre-plugin-archive build.zig (no
+  # such option) don't choke on an unknown `-D` flag — same gating as
+  # `-Dplugin_c_nifs`. Pure; public (@doc false) for testing.
+  @doc false
+  @spec plugin_static_lib_args([Path.t()]) :: [String.t()]
+  def plugin_static_lib_args([]), do: []
+
+  def plugin_static_lib_args(paths) when is_list(paths),
+    do: ["-Dplugin_static_libs=#{Enum.join(paths, ",")}"]
+
+  # Build every activated cpp_archive plugin NIF for one target ABI. Returns
+  # `{:ok, archive_paths}` (empty when no such plugin is active), or a tagged
+  # error string from the cross-compile.
+  #
+  # When a cpp_archive plugin IS active but `target_id` is an ABI CppArchive
+  # can't build (today the x86_64 Android emulator → :android_x86_64), this is
+  # a HARD build error rather than a logged skip: the per-platform driver_tab
+  # still references `<module>_nif_init` as a strong-undefined symbol, so
+  # silently returning {:ok, []} produces an unresolved-symbol link failure
+  # later (and only on-device). Failing here, by name, is the actionable
+  # signal. When no cpp_archive plugin is active the ABI gap is harmless, so
+  # the `specs == []` clause short-circuits first and unsupported ABIs build
+  # fine.
+  @spec build_plugin_static_archives(atom(), :ios | :android, Path.t()) ::
+          {:ok, [Path.t()]} | {:error, String.t()}
+  defp build_plugin_static_archives(target_id, platform, otp_dir) do
+    specs = MobDev.Plugin.Merge.static_archives(MobDev.Plugin.activated(), platform)
+
+    case cpp_archive_target_decision(specs, target_id) do
+      :none -> {:ok, []}
+      {:error, msg} -> raise msg
+      :build -> do_build_plugin_static_archives(specs, target_id, otp_dir)
+    end
+  end
+
+  @doc false
+  # Pure decision for `build_plugin_static_archives/3`, extracted so the
+  # short-circuit (no active cpp_archive plugin) and the hard-error (active
+  # plugin on an unsupported ABI) are unit-testable without driving a build:
+  #
+  #   * `:none`         — no cpp_archive spec needs building (ABI gap is
+  #                       harmless; an unsupported ABI like x86_64 builds fine)
+  #   * `{:error, msg}` — a spec IS present but `target_id` isn't one CppArchive
+  #                       can build → hard build error (the driver_tab still
+  #                       references `<module>_nif_init`, so {:ok, []} would
+  #                       defer an unresolved-symbol link failure to on-device)
+  #   * `:build`        — a spec is present and the ABI is supported
+  @spec cpp_archive_target_decision([map()], atom()) ::
+          :none | :build | {:error, String.t()}
+  def cpp_archive_target_decision([], _target_id), do: :none
+
+  def cpp_archive_target_decision(specs, target_id) do
+    if target_id in MobDev.Plugin.CppArchive.targets(),
+      do: :build,
+      else: {:error, unsupported_cpp_archive_target_error(specs, target_id)}
+  end
+
+  @doc false
+  # Build-error message for an active cpp_archive plugin on an ABI CppArchive
+  # can't target yet. Pure string builder, public so the failure path is
+  # testable without driving a full Android build.
+  @spec unsupported_cpp_archive_target_error([map()], atom()) :: String.t()
+  def unsupported_cpp_archive_target_error(specs, target_id) do
+    names = Enum.map_join(specs, ", ", &"#{&1.plugin}/#{&1.module}")
+
+    "cpp_archive plugin NIF(s) [#{names}] cannot be built for #{inspect(target_id)} — " <>
+      "MobDev.Plugin.CppArchive has no target for this ABI. cpp_archive currently " <>
+      "supports Android arm64 (:android_arm64) and arm32 (:android_arm32) only " <>
+      "(plus :ios_sim / :ios_device). The x86_64 Android emulator ABI is not " <>
+      "supported: building it would link <module>_nif_init as an unresolved symbol " <>
+      "and fail at link time on-device. Drop x86_64 from this build (target an " <>
+      "arm64/arm32 device or emulator), or remove the cpp_archive plugin for x86_64."
+  end
+
+  defp do_build_plugin_static_archives(specs, target_id, otp_dir) do
+    with {:ok, erts_inc} <- resolve_erts_include(otp_dir) do
+      out_dir =
+        Path.join([Mix.Project.build_path(), "plugin_archives", Atom.to_string(target_id)])
+
+      specs
+      |> Enum.reduce_while({:ok, []}, fn spec, {:ok, acc} ->
+        IO.puts(
+          "  === Building #{MobDev.Plugin.CppArchive.archive_name(spec.module)} (#{target_id}, #{spec.plugin})"
+        )
+
+        case MobDev.Plugin.CppArchive.build(spec, target_id,
+               out_dir: out_dir,
+               erts_include: erts_inc
+             ) do
+          {:ok, info} ->
+            IO.puts("    ✓ #{info.archive}")
+            {:cont, {:ok, [info.archive | acc]}}
+
+          {:error, {tag, detail}} ->
+            {:halt,
+             {:error,
+              "plugin cpp_archive #{spec.plugin}/#{spec.module} failed " <>
+                "(#{target_id}, #{tag}): #{inspect(detail)}"}}
+        end
+      end)
+      |> case do
+        {:ok, paths} -> {:ok, Enum.reverse(paths)}
+        err -> err
+      end
+    end
+  end
+
+  @doc false
+  # Android ABI string → CppArchive target id. x86_64 maps to :android_x86_64,
+  # which CppArchive doesn't build yet — `build_plugin_static_archives/3` raises
+  # a hard build error (rather than silently linking an unresolved init symbol)
+  # when a cpp_archive plugin is actually active for that ABI. nil = a truly
+  # unknown ABI string. Public for unit testing the mapping matrix.
+  @spec android_abi_to_cpp_target(String.t()) :: atom() | nil
+  def android_abi_to_cpp_target("arm64-v8a"), do: :android_arm64
+  def android_abi_to_cpp_target("arm64"), do: :android_arm64
+  def android_abi_to_cpp_target("armeabi-v7a"), do: :android_arm32
+  def android_abi_to_cpp_target("arm32"), do: :android_arm32
+  def android_abi_to_cpp_target("x86_64"), do: :android_x86_64
+  def android_abi_to_cpp_target(_), do: nil
+
+  # ── TFLite NIF integration (mirrors NxEigen above) ─────────────────────────
+  # Same shape as nxeigen but with TFLite-specific details: the runtime
+  # library (libtensorflowlite_jni.so on Android, TensorFlowLiteC.framework
+  # on iOS) is fetched via TfliteDownloader and the NIF is cross-compiled
+  # via TfliteNif. Both .so / framework get bundled into the deployed app
+  # alongside the static NIF archive — see `copy_tflite_runtime_lib_android/2`
+  # and the iOS framework-copy step in the device assembly path.
+
+  defp tflite_in_project? do
+    Mix.Project.config()[:deps] |> Enum.any?(&match_tflite_dep?/1)
+  end
+
+  defp match_tflite_dep?(dep) do
+    case dep do
+      {:nx_tflite_mob, _} -> true
+      {:nx_tflite_mob, _, _} -> true
+      _ -> false
+    end
+  end
+
+  defp maybe_build_tflite(target_id)
+       when target_id in [:android_arm64, :android_arm32, :ios_sim, :ios_device] do
+    if tflite_in_project?() do
+      do_build_tflite(target_id)
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp do_build_tflite(target_id) do
+    # Use Mix.Project.deps_paths()[:nx_tflite_mob] rather than
+    # Path.join(deps_path, "nx_tflite_mob") so `path:` and `github:` deps
+    # both resolve correctly. `path:` deps don't get symlinked into
+    # deps/ — they're consumed in-place from the user's source.
+    nx_tflite_mob_dir = Mix.Project.deps_paths()[:nx_tflite_mob]
+
+    with :ok <-
+           (if nx_tflite_mob_dir do
+              :ok
+            else
+              {:error,
+               "Mix.Project.deps_paths() has no :nx_tflite_mob entry — is it in mix deps?"}
+            end),
+         {:ok, tflite_dir} <- MobDev.TfliteDownloader.ensure(target_id),
+         {:ok, erts_inc} <- tflite_erts_include(target_id) do
+      out_dir = tflite_out_dir(target_id)
+      IO.puts("  === Building libtflite_nif.a (#{target_id})")
+
+      case MobDev.TfliteNif.build(target_id,
+             nx_tflite_mob_dir: nx_tflite_mob_dir,
+             tflite_dir: tflite_dir,
+             erts_include: erts_inc,
+             out_dir: out_dir
+           ) do
+        {:ok, info} ->
+          IO.puts("    ✓ #{info.archive}")
+          {:ok, %{archive: info.archive, tflite_dir: tflite_dir}}
+
+        {:error, {tag, detail}} ->
+          {:error, "TFLite cross-compile failed (#{target_id}, #{tag}): #{inspect(detail)}"}
+      end
+    end
+  end
+
+  defp tflite_out_dir(target_id),
+    do: Path.join([Mix.Project.build_path(), "tflite", Atom.to_string(target_id)])
+
+  defp tflite_erts_include(:ios_sim),
+    do: resolve_erts_include(MobDev.OtpDownloader.ios_sim_otp_dir())
+
+  defp tflite_erts_include(:ios_device),
+    do: resolve_erts_include(MobDev.OtpDownloader.ios_device_otp_dir())
+
+  defp tflite_erts_include(:android_arm64),
+    do: resolve_erts_include(MobDev.OtpDownloader.android_otp_dir("arm64-v8a"))
+
+  defp tflite_erts_include(:android_arm32),
+    do: resolve_erts_include(MobDev.OtpDownloader.android_otp_dir("armeabi-v7a"))
+
+  @doc false
+  @spec tflite_zig_args_android(nil | map()) :: [String.t()]
+  def tflite_zig_args_android(nil), do: []
+
+  def tflite_zig_args_android(%{archive: archive_path}) when is_binary(archive_path) do
+    ["-Dtflite_static=true", "-Dtflite_lib=#{archive_path}"]
+  end
+
+  @doc false
+  @spec tflite_zig_args_ios(nil | map()) :: [String.t()]
+  def tflite_zig_args_ios(nil), do: []
+
+  def tflite_zig_args_ios(%{archive: archive_path, tflite_dir: tflite_dir})
+      when is_binary(archive_path) and is_binary(tflite_dir) do
+    [
+      "-Dtflite_static=true",
+      "-Dtflite_dir=#{Path.dirname(archive_path)}",
+      "-Dtflite_framework_dir=#{Path.join(tflite_dir, "Frameworks")}"
+    ]
+  end
+
+  @doc """
+  Copy the TFLite runtime library (`libtensorflowlite_jni.so`) into the
+  Android app's `jniLibs/<abi>/` so the APK packager includes it. Called
+  during the Android assemble step when TFLite is enabled.
+
+  `project_root` defaults to the current working directory — that's the
+  Mob-app project root in normal `mix mob.deploy` invocations. Tests
+  pass an explicit path to avoid cd'ing into a temp dir (which would
+  race other tests' parallel compilation).
+
+  No-op when `tflite_build` is nil (TFLite not enabled in this project).
+  """
+  @spec copy_tflite_runtime_lib_android(nil | map(), String.t(), Path.t() | nil) :: :ok
+  def copy_tflite_runtime_lib_android(tflite_build, abi, project_root \\ nil)
+  def copy_tflite_runtime_lib_android(nil, _abi, _project_root), do: :ok
+
+  def copy_tflite_runtime_lib_android(%{tflite_dir: tflite_dir}, abi, project_root) do
+    root = project_root || File.cwd!()
+    src = Path.join([tflite_dir, "jni", abi, "libtensorflowlite_jni.so"])
+    dst_dir = Path.join([root, "android/app/src/main/jniLibs", abi])
+    File.mkdir_p!(dst_dir)
+    dst = Path.join(dst_dir, "libtensorflowlite_jni.so")
+
+    if File.regular?(src) do
+      File.cp!(src, dst)
+      IO.puts("  === Copied libtensorflowlite_jni.so to #{dst}")
+      :ok
+    else
+      raise "TFLite runtime lib missing at #{src}"
+    end
+  end
+
+  @doc """
+  Copy the TFLite frameworks (Core + CoreML + Metal) into the iOS app's
+  `Frameworks/` dir so the .app bundle ships them. Called during iOS
+  app assembly when TFLite is enabled.
+
+  Same pattern as `Python.framework` embedding. Codesigning happens at
+  the app-bundle level — the frameworks just need to be present in the
+  bundle when the codesign step runs.
+
+  `slice` is either `"ios-arm64"` (device) or
+  `"ios-arm64_x86_64-simulator"` (sim).
+
+  No-op when `tflite_build` is nil.
+  """
+  @spec copy_tflite_frameworks_ios(nil | map(), String.t(), Path.t()) :: :ok
+  def copy_tflite_frameworks_ios(nil, _slice, _app_frameworks_dir), do: :ok
+
+  def copy_tflite_frameworks_ios(%{tflite_dir: _tflite_dir}, _slice, _app_frameworks_dir) do
+    # No-op: TFLite's xcframework slices ship binaries as MH_OBJECT
+    # (filetype=1, relocatable object) rather than MH_DYLIB. The linker
+    # at build time (-F<path> -framework TensorFlowLiteC via swiftc)
+    # pulls the object content directly into the app's main Mach-O
+    # binary, statically. There's no runtime dylib to resolve, so the
+    # .framework bundles do NOT need to be embedded in the .app's
+    # Frameworks/ dir. Doing so would also fail iOS install:
+    #
+    # * the bundles lack Info.plist (CocoaPods generates them)
+    # * the bundles' MH_OBJECT binaries can't be re-signed in a way
+    #   modern iOS accepts ("code signature version is no longer
+    #   supported" — codesign only produces v3 sigs for MH_EXECUTE /
+    #   MH_DYLIB)
+    #
+    # If a future TFLite release ships true MH_DYLIB frameworks, we'll
+    # need to re-enable the copy + framework codesign step. For now this
+    # caller is kept around as a documentation hook + future-compat
+    # point.
+    IO.puts("  === TFLite frameworks linked statically (no .app embedding)")
+    :ok
   end
 
   # ── iOS device-specific build helpers (Phase 2 iter 13c) ─────────────────────
@@ -2808,9 +6205,16 @@ defmodule MobDev.NativeBuild do
   # Build args to pass to `zig build`. Returns
   # `{:ok, ["-Dproject_c_nifs=…", "-Dproject_rust_libs=…", "-Dproject_root=…"]}`
   # or `{:error, reason}` if a Rust cross-compile fails.
-  @spec project_nif_zig_args(:ios_device | :ios_sim | :android_arm64 | :android_arm32) ::
+  @spec project_nif_zig_args(
+          :ios_device
+          | :ios_sim
+          | :android_arm64
+          | :android_arm32
+          | :android_x86_64
+        ) ::
           {:ok, [String.t()]} | {:error, String.t()}
-  defp project_nif_zig_args(platform) do
+  @doc false
+  def project_nif_zig_args(platform) do
     project_root = File.cwd!()
     # Respect each entry's `:archs` field — a NIF with
     # `archs: [:ios]` (in mob.exs `:static_nifs`) should be skipped on
@@ -2822,9 +6226,10 @@ defmodule MobDev.NativeBuild do
     # `on_platform?/2` understands.
     target_arch =
       case platform do
-        p when p in [:ios_device, :ios_sim] -> :ios
+        p when p in [:ios_device, :ios_sim] -> p
         :android_arm64 -> :android_arm64
         :android_arm32 -> :android_arm32
+        :android_x86_64 -> :android
       end
 
     entries =
@@ -2848,19 +6253,34 @@ defmodule MobDev.NativeBuild do
         end
       end)
 
+    # Per-ABI external static archives declared via `:extra_static_libs` on the
+    # already platform-filtered entries. These resolve a project NIF's `extern`
+    # symbols at the app link without making the host-rendered NIF link against
+    # an archive for the wrong architecture.
+    extra_static_libs =
+      Enum.flat_map(entries, fn entry ->
+        case entry |> Map.get(:extra_static_libs, %{}) |> Map.get(platform) do
+          nil -> []
+          path -> [Path.expand(path, project_root)]
+        end
+      end)
+
+    nif_static_flags =
+      for entry <- entries, Map.has_key?(entry, :guard), do: "-D#{entry.module}_static=true"
+
     with {:ok, rust_libs} <- cross_compile_rust_nifs(rust_manifests, platform),
          {:ok, zig_libs} <- cross_compile_zig_nifs(zig_modules, platform) do
       # Pass both Rust and Zig static archives via the same flag
       # (they go to the same linker step). Name kept legacy-flavored
       # for the build template's existing consumer; sweep up later.
-      static_libs = Enum.reverse(rust_libs) ++ Enum.reverse(zig_libs)
+      static_libs = Enum.reverse(rust_libs) ++ Enum.reverse(zig_libs) ++ extra_static_libs
 
       {:ok,
        [
          "-Dproject_root=#{project_root}",
          "-Dproject_c_nifs=#{Enum.join(Enum.reverse(c_names), ",")}",
          "-Dproject_rust_libs=#{Enum.join(static_libs, ",")}"
-       ]}
+       ] ++ nif_static_flags}
     end
   end
 
@@ -2923,6 +6343,7 @@ defmodule MobDev.NativeBuild do
   defp rust_target_for(:ios_sim), do: "aarch64-apple-ios-sim"
   defp rust_target_for(:android_arm64), do: "aarch64-linux-android"
   defp rust_target_for(:android_arm32), do: "armv7-linux-androideabi"
+  defp rust_target_for(:android_x86_64), do: "x86_64-linux-android"
 
   # ── Zigler cross-compile (issue #15 final piece) ─────────────────────────
 
@@ -2966,7 +6387,7 @@ defmodule MobDev.NativeBuild do
 
   defp sdkroot_args_for(:android_arm64), do: {:ok, ["-Dandroid_sdkroot=#{ndk_sysroot()}"]}
   defp sdkroot_args_for(:android_arm32), do: {:ok, ["-Dandroid_sdkroot=#{ndk_sysroot()}"]}
-  defp sdkroot_args_for(_), do: {:ok, []}
+  defp sdkroot_args_for(:android_x86_64), do: {:ok, ["-Dandroid_sdkroot=#{ndk_sysroot()}"]}
 
   # Drives Zigler's build pipeline a SECOND time against the staging
   # directory (which Zigler set up during the normal `mix compile` host
@@ -3028,6 +6449,7 @@ defmodule MobDev.NativeBuild do
         # + armv7) doesn't overwrite the first build's archive — the
         # default `zig-out/` would clobber on the second invocation.
         prefix = "zig-out-#{target}"
+        path_args = zigler_build_path_args(module, staging_dir)
 
         args =
           [
@@ -3037,7 +6459,7 @@ defmodule MobDev.NativeBuild do
             "-Dnif_init_alias=#{name}_nif_init",
             "--prefix",
             prefix
-          ] ++ sdkroot_args
+          ] ++ path_args ++ sdkroot_args
 
         case System.cmd(zig_exe, args,
                cd: staging_dir,
@@ -3078,6 +6500,48 @@ defmodule MobDev.NativeBuild do
             {:error, "zig build for Zig NIF '#{name}' exited #{code}"}
         end
     end
+  end
+
+  defp zigler_build_path_args(module, staging_dir) do
+    erts_include =
+      Path.join([:code.root_dir(), "erts-#{:erlang.system_info(:version)}", "include"])
+
+    zigler_priv = :zigler |> :code.priv_dir() |> to_string()
+    erl_nif_win_path = Path.join(zigler_priv, "erl_nif_win")
+
+    erl_nif_header =
+      if :os.type() == {:win32, :nt},
+        do: Path.join(erl_nif_win_path, "erl_nif_win.h"),
+        else: Path.join(erts_include, "erl_nif.h")
+
+    module_root = zigler_module_root(module, staging_dir)
+
+    [
+      "-Derts_include=#{erts_include}",
+      "-Derl_nif_header=#{erl_nif_header}",
+      "-Derl_nif_win_path=#{erl_nif_win_path}",
+      "-Dzigler_priv=#{zigler_priv}",
+      "-Dmodule_root=#{module_root}"
+    ]
+  end
+
+  defp zigler_module_root(module, staging_dir) do
+    build_zig = Path.join(staging_dir, "build.zig")
+
+    with {:ok, source} <- File.read(build_zig),
+         [_match, basename] <- Regex.run(~r/&\.\{\s*module_root,\s*"([^"]+)"\s*\}/, source),
+         [path | _] <- Path.wildcard(Path.join(File.cwd!(), "**/#{basename}"), match_dot: true) do
+      Path.dirname(path)
+    else
+      _ -> module_source_root(module)
+    end
+  end
+
+  defp module_source_root(module) do
+    module.module_info(:compile)
+    |> Keyword.fetch!(:source)
+    |> to_string()
+    |> Path.dirname()
   end
 
   # Re-archives a Zig-built `.a` using `xcrun ar` so its members are
@@ -3128,6 +6592,7 @@ defmodule MobDev.NativeBuild do
   # `androideabi` ABI marker matches Rust's `armv7-linux-androideabi`
   # for ELF-level compatibility when both libs land in the same .so.
   defp zig_build_target_for(:android_arm32), do: "arm-linux-androideabi"
+  defp zig_build_target_for(:android_x86_64), do: "x86_64-linux-android"
 
   @spec generate_erl_errno_compat_stub(Path.t()) :: :ok
   def generate_erl_errno_compat_stub(build_dir) do
@@ -3153,11 +6618,34 @@ defmodule MobDev.NativeBuild do
          epmd_build_src,
          build_dir,
          display_name,
+         project_swift_sources,
          sqlite_static_lib,
          mlx_dir,
-         nxeigen_archive
+         nxeigen_archive,
+         tflite_build
        ) do
     driver_tab = resolve_driver_tab_ios(mob_dir)
+
+    # Plugin contributions, same as the sim path above.
+    activated_plugins = MobDev.Plugin.activated()
+
+    # Capability enforcement — same one-liner the sim path uses. See
+    # MOB_PLUGIN_SECURITY.md, Layer 2.
+    MobDev.Plugin.Validator.raise_on_capability_drift!(activated_plugins)
+
+    # See sim build for the rationale (MOB-7). A plugin-aware build_device.zig
+    # implies an AppDelegate that always calls mob_register_plugins(), so a
+    # zero-plugin app still needs the bootstrap; legacy scaffolds get empty flags.
+    {plugin_swift_files, plugin_frameworks} =
+      ios_plugin_swift_and_frameworks(
+        activated_plugins,
+        build_dir,
+        Path.expand("ios/build_device.zig")
+      )
+
+    # Activated plugins' C NIF sources — see the sim build for the full
+    # rationale. Same path on device; the iPhone uses build_device.zig.
+    plugin_c_nifs = MobDev.Plugin.Merge.nif_sources(activated_plugins, :ios) |> Enum.join(",")
 
     base_args = [
       "build",
@@ -3174,10 +6662,21 @@ defmodule MobDev.NativeBuild do
       "-Dproject_ios_dir=#{Path.expand("ios")}",
       "-Dmodule_name=#{display_name}",
       "-Depmd_build_src=#{epmd_build_src}",
-      "-Derrno_compat=#{Path.join(build_dir, "erl_errno_id_compat.c")}"
+      "-Derrno_compat=#{Path.join(build_dir, "erl_errno_id_compat.c")}",
+      "-Dproject_swift_sources=#{project_swift_sources}"
     ]
 
-    with {:ok, nif_args} <- project_nif_zig_args(:ios_device) do
+    plugin_args =
+      for {name, val} <- [
+            {"plugin_swift_files", plugin_swift_files},
+            {"plugin_frameworks", plugin_frameworks},
+            {"plugin_c_nifs", plugin_c_nifs}
+          ],
+          val != "",
+          do: "-D#{name}=#{val}"
+
+    with {:ok, nif_args} <- project_nif_zig_args(:ios_device),
+         {:ok, plugin_archives} <- build_plugin_static_archives(:ios_device, :ios, otp_root) do
       sqlite_args =
         case sqlite_static_lib do
           nil -> []
@@ -3186,10 +6685,13 @@ defmodule MobDev.NativeBuild do
 
       args =
         base_args ++
+          plugin_args ++
           nif_args ++
           sqlite_args ++
           mlx_zig_args(mlx_dir) ++
-          nxeigen_zig_args_ios(nxeigen_archive)
+          nxeigen_zig_args_ios(nxeigen_archive) ++
+          tflite_zig_args_ios(tflite_build) ++
+          plugin_static_lib_args(plugin_archives)
 
       case System.cmd("zig", args, stderr_to_stdout: true, into: IO.stream()) do
         {_, 0} ->
@@ -3267,30 +6769,85 @@ defmodule MobDev.NativeBuild do
   prefix of one), return the matching booted simulator's full UDID
   or nil.
 
-  When `device_id` is nil → first booted sim wins.
-  When `device_id` is a string → case-insensitive prefix match
-  against booted UDIDs. A full UDID matches itself; an 8-char
-  prefix matches the corresponding device. Public for testing —
-  JSON shape is the contract.
+  When `device_id` is nil, exactly one booted simulator must exist.
+  When `device_id` is a string, exactly one case-insensitive prefix
+  match must exist. Malformed inventories, duplicate entries, empty
+  identifiers, and ambiguous matches return nil. Public for testing —
+  the JSON shape and fail-closed uniqueness are the contract.
   """
   @spec resolve_booted_udid(map(), String.t() | nil) :: String.t() | nil
-  def resolve_booted_udid(by_runtime, device_id) do
-    booted_udids =
-      by_runtime
-      |> Map.values()
-      |> List.flatten()
-      |> Enum.filter(&match?(%{"state" => "Booted"}, &1))
-      |> Enum.map(& &1["udid"])
+  def resolve_booted_udid(by_runtime, device_id) when is_map(by_runtime) do
+    with true <- valid_optional_ios_target_id?(device_id),
+         {:ok, booted_udids} <- collect_booted_udids(Map.values(by_runtime), []) do
+      matches =
+        case device_id do
+          nil ->
+            booted_udids
 
-    case device_id do
-      nil ->
-        List.first(booted_udids)
+          id ->
+            needle = String.downcase(id)
 
-      id when is_binary(id) ->
-        needle = String.downcase(id)
-        Enum.find(booted_udids, fn udid -> String.starts_with?(String.downcase(udid), needle) end)
+            Enum.filter(booted_udids, fn udid ->
+              String.starts_with?(String.downcase(udid), needle)
+            end)
+        end
+
+      case matches do
+        [udid] -> udid
+        _none_or_ambiguous -> nil
+      end
+    else
+      _invalid_or_malformed -> nil
     end
   end
+
+  def resolve_booted_udid(_invalid_inventory, _device_id), do: nil
+
+  defp collect_booted_udids([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp collect_booted_udids([devices | remaining_runtimes], acc) do
+    with {:ok, next_acc} <- collect_booted_runtime_devices(devices, acc) do
+      collect_booted_udids(remaining_runtimes, next_acc)
+    end
+  end
+
+  defp collect_booted_udids(_improper_runtime_list, _acc), do: {:error, :malformed_inventory}
+
+  defp collect_booted_runtime_devices([], acc), do: {:ok, acc}
+
+  defp collect_booted_runtime_devices([%{"state" => "Booted", "udid" => udid} | devices], acc) do
+    if valid_ios_target_id?(udid) do
+      collect_booted_runtime_devices(devices, [udid | acc])
+    else
+      {:error, :malformed_booted_device}
+    end
+  end
+
+  defp collect_booted_runtime_devices([%{"state" => "Booted"} | _devices], _acc),
+    do: {:error, :malformed_booted_device}
+
+  defp collect_booted_runtime_devices(
+         [%{"state" => state, "udid" => udid} | devices],
+         acc
+       )
+       when state in ["Shutdown", "Shutting Down", "Creating"] do
+    if valid_ios_target_id?(udid) do
+      collect_booted_runtime_devices(devices, acc)
+    else
+      {:error, :malformed_non_booted_device}
+    end
+  end
+
+  defp collect_booted_runtime_devices(_malformed_devices, _acc),
+    do: {:error, :malformed_inventory}
+
+  defp valid_optional_ios_target_id?(nil), do: true
+  defp valid_optional_ios_target_id?(id), do: valid_ios_target_id?(id)
+
+  defp valid_ios_target_id?(id) when is_binary(id),
+    do: byte_size(id) in 1..256 and String.valid?(id)
+
+  defp valid_ios_target_id?(_invalid), do: false
 
   defp sim_lookup_error_message(nil),
     do: "No booted simulator. Boot one in Simulator.app or pass `--device <UDID>`."
@@ -3318,7 +6875,10 @@ defmodule MobDev.NativeBuild do
         {:error, "ios/Info.plist not found — required for the .app bundle"}
 
       true ->
-        File.cp!("ios/Info.plist", Path.join(app_path, "Info.plist"))
+        info_plist = Path.join(app_path, "Info.plist")
+        File.cp!("ios/Info.plist", info_plist)
+        apply_plugin_plist_keys!(info_plist)
+        apply_fonts_to_ios_bundle!(info_plist, app_path)
         if File.dir?("ios/Assets.xcassets/AppIcon.appiconset"), do: compile_ios_icons(app_path)
         {:ok, app_path}
     end
@@ -3402,6 +6962,7 @@ defmodule MobDev.NativeBuild do
          {:ok, python_bundle} <- maybe_ensure_python_bundle(),
          {:ok, mlx_dir} <- maybe_ensure_mlx_dir(:ios_device),
          {:ok, nxeigen_archive} <- maybe_build_nxeigen(:ios_device),
+         {:ok, tflite_build} <- maybe_build_tflite(:ios_device),
          {:ok, sdkroot} <- xcrun_sdk_path_device(),
          erts_vsn = detect_erts_vsn(otp_root) || "erts-17.0",
          otp_release = detect_otp_release(otp_root) || "27",
@@ -3410,6 +6971,7 @@ defmodule MobDev.NativeBuild do
          epmd_build_src = cfg[:ios_epmd_build_src] || otp_root,
          app_module = Mix.Project.config() |> Keyword.fetch!(:app) |> Atom.to_string(),
          display_name = ios_display_name(),
+         project_swift_sources = project_swift_sources_arg(cfg),
          build_dir =
            Path.join(System.tmp_dir!(), "mob_ios_device_#{System.unique_integer([:positive])}"),
          _ = File.mkdir_p!(build_dir),
@@ -3444,13 +7006,21 @@ defmodule MobDev.NativeBuild do
              epmd_build_src,
              build_dir,
              display_name,
+             project_swift_sources,
              sqlite_static_lib,
              mlx_dir,
-             nxeigen_archive
+             nxeigen_archive,
+             tflite_build
            ),
          binary_path = Path.join(build_dir, display_name),
          :ok <- check_path(binary_path, "iOS device binary"),
          {:ok, app_path} <- bundle_ios_device_app(binary_path, otp_root, cfg, build_dir),
+         :ok <-
+           copy_tflite_frameworks_ios(
+             tflite_build,
+             "ios-arm64",
+             Path.join(app_path, "Frameworks")
+           ),
          :ok <- maybe_slim_otp_bundle(app_path, cfg),
          :ok <- embed_provisioning_profile(app_path, cfg[:ios_profile_uuid]),
          :ok <- codesign_ios_device_app(app_path, cfg, build_dir),
@@ -3499,6 +7069,8 @@ defmodule MobDev.NativeBuild do
       true ->
         info_plist = Path.join(app_path, "Info.plist")
         File.cp!("ios/Info.plist", info_plist)
+        apply_plugin_plist_keys!(info_plist)
+        apply_fonts_to_ios_bundle!(info_plist, app_path)
         plist_set!(info_plist, ":CFBundleIdentifier", bundle_id)
         plist_set!(info_plist, ":CFBundleExecutable", app_name)
         plist_set!(info_plist, ":CFBundleName", app_name)
@@ -3540,6 +7112,1006 @@ defmodule MobDev.NativeBuild do
 
     :ok
   end
+
+  # Adds plugin-declared Info.plist keys via PlistBuddy `Add`. Add fails (and is
+  # ignored) when the key is already present, giving us "project Info.plist wins
+  # on conflict; plugins fill gaps" semantics — so a plugin can ship a default
+  # NSCameraUsageDescription that the app author can override in their own
+  # Info.plist without changing the plugin. See ADR
+  # decisions/2026-05-28-plugin-plist-keys-merge.md.
+  defp apply_plugin_plist_keys!(info_plist) do
+    activated_plugins = MobDev.Plugin.activated()
+
+    for {key, value} <- MobDev.Plugin.Merge.plist_keys(activated_plugins) do
+      cond do
+        # Array-valued keys (e.g. UIBackgroundModes) MERGE into any existing
+        # array — append the missing string entries, deduped — rather than
+        # clobber. Lets a plugin contribute `bluetooth-central` without wiping a
+        # host's `audio` entry (mob_background) and vice versa.
+        is_list(value) ->
+          plist_merge_array!(info_plist, key, value)
+
+        true ->
+          case plist_add_type(value) do
+            {:ok, type, str_value} ->
+              plist_add(info_plist, ":#{key}", type, str_value)
+
+            :unsupported ->
+              Mix.shell().info(
+                "  [plugin plist] skipping :#{key} — unsupported value type #{inspect(value)}"
+              )
+          end
+      end
+    end
+
+    :ok
+  end
+
+  # Ensure `key` is an `<array>` in the plist and append every string item in
+  # `items` that isn't already present (order-preserving, deduped against what's
+  # on disk). PlistBuddy `Add :key array` is a no-op when the array already
+  # exists (the duplicate-key swallow in plist_add/4), so this composes with a
+  # host plist that already declares the key.
+  defp plist_merge_array!(plist, key, items) do
+    plist_add(plist, ":#{key}", "array", "")
+
+    existing = plist_array_entries(plist, ":#{key}")
+
+    for item <- plist_array_additions(existing, items) do
+      plist_add(plist, ":#{key}:", "string", item)
+    end
+
+    :ok
+  end
+
+  @doc false
+  # Pure: given the array entries already on disk and a plugin's desired items,
+  # return the string items to append — binaries only, not already present,
+  # de-duplicated, input order preserved. Extracted so the merge decision is
+  # unit-testable without PlistBuddy.
+  @spec plist_array_additions([String.t()], [term()]) :: [String.t()]
+  def plist_array_additions(existing, items) do
+    items
+    |> Enum.filter(&is_binary/1)
+    |> Enum.uniq()
+    |> Enum.reject(&(&1 in existing))
+  end
+
+  # Read the current string entries of an `<array>` plist key via PlistBuddy
+  # `Print`. Returns [] when the key is absent or not an array.
+  defp plist_array_entries(plist, key) do
+    case System.cmd("/usr/libexec/PlistBuddy", ["-c", "Print #{key}", plist],
+           stderr_to_stdout: true
+         ) do
+      {out, 0} ->
+        out
+        |> String.split("\n")
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 in ["Array {", "}", ""]))
+
+      _ ->
+        []
+    end
+  end
+
+  defp plist_add_type(value) when is_binary(value), do: {:ok, "string", value}
+  defp plist_add_type(true), do: {:ok, "bool", "true"}
+  defp plist_add_type(false), do: {:ok, "bool", "false"}
+
+  defp plist_add_type(value) when is_integer(value),
+    do: {:ok, "integer", Integer.to_string(value)}
+
+  defp plist_add_type(_other), do: :unsupported
+
+  # PlistBuddy `Add` is non-zero on duplicate-key (and on a few other failure
+  # modes we'd want to know about). We swallow the duplicate-key case
+  # deliberately — that's our project-wins mechanism — and accept that other
+  # PlistBuddy errors will pass silently. The first plugin that hits a real
+  # problem here can extend this to inspect stderr and surface non-duplicate
+  # failures.
+  defp plist_add(plist, key, type, value) do
+    System.cmd(
+      "/usr/libexec/PlistBuddy",
+      ["-c", "Add #{key} #{type} #{value}", plist],
+      stderr_to_stdout: true
+    )
+
+    :ok
+  end
+
+  # ── Android plugin contributions: manifest + gradle ──────────────────────────
+
+  @android_manifest_path "android/app/src/main/AndroidManifest.xml"
+  @android_app_gradle_path "android/app/build.gradle"
+  @android_java_root "android/app/src/main/java"
+  # Generated startup hook (package io.mob.plugin). MainActivity.onCreate calls
+  # io.mob.plugin.MobPluginBootstrap.registerAll(this).
+  @plugin_bootstrap_path "android/app/src/main/java/io/mob/plugin/MobPluginBootstrap.kt"
+  # Generated stable contract: a bridge class implements MobActivityAware to be
+  # handed the host Activity by registerAll. Always written next to the bootstrap.
+  @plugin_activity_aware_path "android/app/src/main/java/io/mob/plugin/MobActivityAware.kt"
+  # Generated stable contract: a bridge class implements MobPermissionProvider to
+  # supply the cap->Android-permission-string mapping for a capability core no
+  # longer knows about (the permission-registry extension). Always written.
+  @plugin_permission_provider_path "android/app/src/main/java/io/mob/plugin/MobPermissionProvider.kt"
+  # Generated stable seam: notification-delivery state shared between HOST
+  # delivery code (MobFirebaseService / MainActivity / NotificationReceiver,
+  # app package) and the mob_notify plugin bridge (io.mob.notify) — neither
+  # can reference the other's package directly. Always written.
+  @plugin_notify_hub_path "android/app/src/main/java/io/mob/plugin/MobNotifyHub.kt"
+
+  # Inserts `<uses-permission android:name="..."/>` lines for each permission
+  # declared by activated plugins into `AndroidManifest.xml`. Idempotent: skips
+  # any permission name already present in the manifest (covers both the
+  # project's hand-rolled declarations and a previous run's plugin merge).
+  #
+  # No-op (with a notice) when the manifest is missing — mirrors how
+  # `MobDev.Enable.Igniter.add_android_permission/2` handles the absence at
+  # `mix mob.enable` time.
+  defp apply_plugin_android_manifest! do
+    activated = MobDev.Plugin.activated()
+
+    # Capability enforcement — same call the iOS sim/device paths use; runs
+    # the AndroidManifest-fragment + Swift-import scans across every
+    # activated plugin and raises on drift. See MOB_PLUGIN_SECURITY.md,
+    # Layer 2.
+    MobDev.Plugin.Validator.raise_on_capability_drift!(activated)
+
+    permissions = MobDev.Plugin.Merge.android_permissions(activated)
+    snippets = for s <- MobDev.Plugin.Merge.android_manifest_snippets(activated), do: s.snippet
+
+    case File.read(@android_manifest_path) do
+      {:error, :enoent} ->
+        if permissions != [] or snippets != [] do
+          IO.puts(
+            "  [plugin android] #{@android_manifest_path} not found — skipping plugin " <>
+              "permissions + manifest components."
+          )
+        end
+
+        :ok
+
+      {:ok, content} ->
+        patched =
+          content
+          |> merge_android_permissions(permissions)
+          |> merge_android_manifest_components(snippets)
+
+        if patched != content, do: File.write!(@android_manifest_path, patched)
+
+        :ok
+    end
+  end
+
+  # Inserts `implementation "<dep>"` lines for each gradle dependency declared
+  # by activated plugins into the app-level `build.gradle`'s `dependencies { }`
+  # block. Idempotent: skips any dep string already mentioned anywhere in the
+  # file (the substring check is intentionally broad — Gradle allows several
+  # syntaxes for the same dep, and we'd rather under-add than duplicate).
+  #
+  # No-op (with a notice) when the gradle file is missing.
+  defp apply_plugin_gradle_deps! do
+    case File.read(@android_app_gradle_path) do
+      {:error, :enoent} ->
+        if MobDev.Plugin.Merge.gradle_deps(MobDev.Plugin.activated()) != [] do
+          IO.puts(
+            "  [plugin android] #{@android_app_gradle_path} not found — skipping plugin gradle_deps."
+          )
+        end
+
+        :ok
+
+      {:ok, content} ->
+        deps = MobDev.Plugin.Merge.gradle_deps(MobDev.Plugin.activated())
+        patched = merge_gradle_deps(content, deps)
+
+        if patched != content, do: File.write!(@android_app_gradle_path, patched)
+
+        :ok
+    end
+  end
+
+  @host_migrations_dir "priv/repo/migrations"
+  @plugin_assets_root "priv/generated/plugin_assets"
+  @plugin_artifact_ledger_dir "priv/generated/.mob_plugin_artifacts"
+
+  @doc false
+  # The removal half of the add/remove plugin lifecycle. A plugin's tier-3
+  # merges COPY files into the host tree (bridge Kotlin into the Kotlin
+  # sourceSet, migrations into priv/repo/migrations, images into the asset
+  # bundle); the runtime manifest + driver_tab are recomputed from scratch each
+  # build, but these copies linger after a plugin is removed — an orphaned
+  # bridge .kt can even break the Gradle compile. This deletes the files a
+  # prior build wrote for one merge concern (`scope`) that the current build no
+  # longer produces: it reads the scope's ledger of relative paths, removes
+  # (previous − current), then persists `current`. Per-scope and only called
+  # when that concern's merge runs, so an iOS-only build never prunes Android
+  # artifacts. Returns the pruned paths (for tests).
+  # The relative paths a prior build recorded for a plugin-artifact `scope`
+  # (empty when none). Shared by the prune and the res host-clobber guard.
+  defp read_plugin_artifact_ledger(scope) do
+    case File.read(Path.join(@plugin_artifact_ledger_dir, to_string(scope))) do
+      {:ok, body} -> String.split(body, "\n", trim: true)
+      _ -> []
+    end
+  end
+
+  @spec __prune_plugin_artifacts__(atom(), [Path.t()]) :: [Path.t()]
+  def __prune_plugin_artifacts__(scope, current) do
+    ledger = Path.join(@plugin_artifact_ledger_dir, to_string(scope))
+    current = current |> Enum.map(&Path.relative_to_cwd/1) |> Enum.uniq()
+
+    previous = read_plugin_artifact_ledger(scope)
+
+    pruned =
+      for stale <- previous -- current, File.exists?(stale) do
+        File.rm!(stale)
+        IO.puts("  ✓ pruned orphaned plugin artifact (plugin removed): #{stale}")
+        stale
+      end
+
+    File.mkdir_p!(@plugin_artifact_ledger_dir)
+    File.write!(ledger, Enum.join(current, "\n"))
+    pruned
+  end
+
+  # Tier 3: copies each activated plugin's migration files into the host's
+  # migrations dir, namespaced by `repo_namespace` (version-preserving) so the
+  # host's existing `Ecto.Migrator` picks them up. Idempotent. No-op when no
+  # plugin declares `:migrations`.
+  # Rebuilds priv/generated/mob_plugins.exs (the host's runtime plugin manifest)
+  # from the activated plugins' current manifests, so the on-device tier-3/4
+  # wiring always matches what the plugins declare at build time.
+  @doc false
+  # Regenerates the on-disk static-NIF driver tables for every format the
+  # project already uses (zig and/or c). A project with no generated driver_tab
+  # files is normally left untouched — a plain app relies on mob's core table at
+  # link time. BUT activating a NIF-bearing plugin adds entries the core table
+  # lacks: without an app-level table the plugin's `<module>_nif_init` links yet
+  # never registers, so `load_nif/2` falls back to dlopen and the NIF is
+  # `:nif_not_loaded` on device. So when plugins contribute NIFs and the app has
+  # no table yet, create one (zig — the default format). Public for tests (and
+  # exercised on every `build_all`).
+  @spec regen_driver_tab!() :: :ok
+  def regen_driver_tab! do
+    formats =
+      __regen_formats__(__driver_tab_formats__(&File.exists?/1), __plugin_nifs_present__())
+
+    for fmt <- formats do
+      paths = Mix.Tasks.Mob.RegenDriverTab.target_paths(fmt)
+
+      expected = %{
+        paths.ios =>
+          MobDev.StaticNifs.generate(:ios, Mix.Tasks.Mob.RegenDriverTab.resolved_nifs(:ios),
+            format: fmt
+          )
+          |> IO.iodata_to_binary(),
+        paths.android =>
+          MobDev.StaticNifs.generate(
+            :android,
+            Mix.Tasks.Mob.RegenDriverTab.resolved_nifs(:android),
+            format: fmt
+          )
+          |> IO.iodata_to_binary()
+      }
+
+      for {path, src} <- expected,
+          File.read(path) != {:ok, src} do
+        existed? = File.exists?(path)
+        File.mkdir_p!(Path.dirname(path))
+        File.write!(path, src)
+        verb = if existed?, do: "regenerated (was stale)", else: "created (plugin NIFs)"
+        IO.puts("  ✓ driver_tab #{verb}: #{path}")
+      end
+    end
+
+    :ok
+  end
+
+  @doc false
+  # True when any activated plugin contributes a NIF — the trigger for creating
+  # an app-level driver_tab where none exists (see regen_driver_tab!/0).
+  @spec __plugin_nifs_present__() :: boolean()
+  def __plugin_nifs_present__ do
+    MobDev.Plugin.Merge.nifs(MobDev.Plugin.activated()) != []
+  end
+
+  @doc false
+  # Pure kernel: which driver_tab formats to (re)generate. An app with existing
+  # tables keeps its format(s). An app with NONE normally generates nothing (it
+  # links against mob's core table) — UNLESS a NIF-bearing plugin is active, in
+  # which case it needs its own table (core + plugin entries), defaulting to
+  # zig. Public for tests.
+  @spec __regen_formats__([:zig | :c], boolean()) :: [:zig | :c]
+  def __regen_formats__([], true), do: [:zig]
+  def __regen_formats__([], false), do: []
+  def __regen_formats__(existing, _plugin_nifs?), do: existing
+
+  defp warn_host_requirements! do
+    case __host_requirements_warning__(
+           MobDev.Plugin.Merge.host_requirements(MobDev.Plugin.activated())
+         ) do
+      nil -> :ok
+      msg -> IO.puts(msg)
+    end
+
+    :ok
+  end
+
+  @doc false
+  # Pure kernel: render the host-obligation warning block (nil when no plugin
+  # declares any). Public for tests.
+  @spec __host_requirements_warning__([%{plugin: atom(), requirement: String.t()}]) ::
+          String.t() | nil
+  def __host_requirements_warning__([]), do: nil
+
+  def __host_requirements_warning__(reqs) do
+    lines = for %{plugin: p, requirement: r} <- reqs, do: "      [#{p}] #{r}"
+
+    IO.ANSI.yellow() <>
+      "  ⚠  plugin host requirements — manual steps the build can NOT do for you:\n" <>
+      Enum.join(lines, "\n") <> IO.ANSI.reset()
+  end
+
+  @doc false
+  # Pure kernel: which driver_tab formats the project uses, decided from file
+  # existence alone (`exists?` is injected so tests don't touch the disk).
+  @spec __driver_tab_formats__((String.t() -> boolean())) :: [:zig | :c]
+  def __driver_tab_formats__(exists?) when is_function(exists?, 1) do
+    for fmt <- [:zig, :c],
+        paths = Mix.Tasks.Mob.RegenDriverTab.target_paths(fmt),
+        exists?.(paths.ios) or exists?.(paths.android),
+        do: fmt
+  end
+
+  defp regen_runtime_manifest! do
+    manifest = MobDev.Plugin.RuntimeManifest.build(MobDev.Plugin.activated())
+    MobDev.Plugin.RuntimeManifest.write(File.cwd!(), manifest)
+    %{screens: s, lifecycle: l, settings: st, notification_handlers: n} = manifest
+
+    IO.puts(
+      "  ✓ runtime plugin manifest (#{length(s)} screens, #{length(l)} lifecycle, " <>
+        "#{length(st)} settings, #{length(n)} handlers)"
+    )
+
+    :ok
+  end
+
+  defp apply_plugin_migrations! do
+    migrations = MobDev.Plugin.Merge.migrations(MobDev.Plugin.activated())
+
+    written =
+      if migrations != [] do
+        File.mkdir_p!(@host_migrations_dir)
+
+        plugin_migs =
+          for m <- migrations do
+            %{
+              repo_namespace: m.repo_namespace,
+              files: Path.wildcard(Path.join(m.migrations_dir, "*.exs"))
+            }
+          end
+
+        for {src, dest} <-
+              MobDev.Plugin.Assets.migration_copies(plugin_migs, @host_migrations_dir) do
+          File.cp!(src, dest)
+          IO.puts("  ✓ plugin migration → #{Path.relative_to_cwd(dest)}")
+          dest
+        end
+      else
+        []
+      end
+
+    # Prune migrations a removed plugin left in the host dir. Deleting the file
+    # does not roll back an already-applied migration (schema_migrations keeps
+    # the record); it just stops Ecto re-running it and keeps the dir honest.
+    __prune_plugin_artifacts__(:migrations, written)
+
+    :ok
+  end
+
+  # Tier 3: copies each activated plugin's images into the host bundle under
+  # `priv/generated/plugin_assets/assets/plugin/<plugin>/<file>` — the path the
+  # core `Mob.Plugins.resolve_image/1` (`plugin://<plugin>/<file>`) resolves to.
+  # No-op when no plugin declares image assets.
+  defp apply_plugin_images! do
+    written =
+      for %{plugin: plugin, images: images} <-
+            MobDev.Plugin.Merge.assets(MobDev.Plugin.activated()),
+          src <- images do
+        rel = MobDev.Plugin.Assets.image_bundle_path(plugin, Path.basename(src))
+        dest = Path.join(@plugin_assets_root, rel)
+        File.mkdir_p!(Path.dirname(dest))
+        File.cp!(src, dest)
+        IO.puts("  ✓ plugin image → #{Path.relative_to_cwd(dest)}")
+        dest
+      end
+
+    # Prune images a removed plugin left in the bundle.
+    __prune_plugin_artifacts__(:images, written)
+
+    :ok
+  end
+
+  @android_res_font "android/app/src/main/res/font"
+
+  # App-level (`priv/fonts/*.ttf|otf`) + plugin (`assets.fonts`) custom fonts.
+  defp collect_all_fonts do
+    app_fonts = Path.wildcard("priv/fonts/*.{ttf,otf,TTF,OTF}")
+
+    plugin_fonts =
+      for %{fonts: fonts} <- MobDev.Plugin.Merge.assets(MobDev.Plugin.activated()),
+          f <- fonts,
+          do: f
+
+    Enum.uniq(app_fonts ++ plugin_fonts)
+  end
+
+  # Copies the app's + plugins' fonts into the iOS `.app` bundle root and lists
+  # them in `Info.plist` UIAppFonts so iOS registers them at launch (the SwiftUI
+  # `Font.custom(name, …)` path in MobRootView then resolves them by name). No-op
+  # when there are no fonts.
+  defp apply_fonts_to_ios_bundle!(info_plist, app_path) do
+    fonts = collect_all_fonts()
+
+    if fonts != [] do
+      copies =
+        case MobDev.Plugin.Assets.plan_ios_font_bundle(fonts) do
+          {:ok, copies} ->
+            copies
+
+          {:error, {:font_basename_collision, name, srcs}} ->
+            Mix.raise(
+              "Font bundle collision: multiple fonts share the iOS bundle name #{name}:\n  " <>
+                Enum.join(srcs, "\n  ") <>
+                "\nRename one so the .app bundle + UIAppFonts stay unambiguous."
+            )
+        end
+
+      for {src, dest} <- copies, do: File.cp!(src, Path.join(app_path, dest))
+      basenames = Enum.map(copies, fn {_src, dest} -> dest end)
+      plist = File.read!(info_plist)
+      File.write!(info_plist, MobDev.Plugin.Assets.merge_ui_app_fonts(plist, basenames))
+      IO.puts("  ✓ bundled #{length(copies)} font(s) + UIAppFonts")
+    end
+
+    :ok
+  end
+
+  # Copies the app's + plugins' fonts into the Android `res/font/` dir under a
+  # normalised resource name (lowercase + underscores; the renderer normalises
+  # the `font:` prop the same way to look them up via `getIdentifier`). Unlike
+  # `assets/`, `res/font/` entries are stored uncompressed, which Android's font
+  # loader requires. No-op when there are no fonts.
+  defp apply_fonts_to_android! do
+    fonts = collect_all_fonts()
+
+    if fonts != [] do
+      copies =
+        case MobDev.Plugin.Assets.plan_android_font_copies(fonts) do
+          {:ok, copies} ->
+            copies
+
+          {:error, {:font_resource_collision, res_name, srcs}} ->
+            Mix.raise(
+              "Font resource collision: multiple fonts normalise to the Android resource #{res_name}:\n  " <>
+                Enum.join(srcs, "\n  ") <>
+                "\nRename one (Android collapses '-', '_', ' ' etc. to '_')."
+            )
+        end
+
+      File.mkdir_p!(@android_res_font)
+
+      for {src, res_filename} <- copies do
+        dest = Path.join(@android_res_font, res_filename)
+        File.cp!(src, dest)
+        IO.puts("  ✓ android font → #{Path.relative_to_cwd(dest)}")
+      end
+    end
+
+    :ok
+  end
+
+  @android_res_root "android/app/src/main"
+
+  # Copies each activated plugin's `android.res_files` into the app's `res/`
+  # tree (at its declared `res/<type>/<file>` destination), so a manifest
+  # component's `@xml/…` reference resolves at build time. Ledger-pruned like
+  # bridge_kt (a res file left by a since-removed plugin is deleted). Raises on
+  # two plugins targeting the same destination with different sources — the
+  # cross-plugin validator catches this at activation, this is the build-time
+  # backstop. No-op (with a notice) when the res root is missing.
+  #
+  # Two safety guards (the manifest validator enforces the first at activation
+  # too; these are the build-time backstop, since `activated/0` can feed
+  # unvalidated manifests):
+  #   * containment — the resolved destination must stay under the app `res/`
+  #     dir, so a `..`-bearing path can't make `File.cp!` write plugin bytes
+  #     anywhere on the build host (path traversal).
+  #   * no host clobber — refuse to overwrite a file this build didn't write on
+  #     a previous run (tracked in the ledger); otherwise a plugin could replace
+  #     a host-owned resource (e.g. res/values/styles.xml) and, worse, the
+  #     ledger prune would later delete the host's file on plugin removal.
+  defp apply_plugin_android_res! do
+    res_files = MobDev.Plugin.Merge.android_res_files(MobDev.Plugin.activated())
+
+    cond do
+      res_files == [] ->
+        :ok
+
+      not File.dir?(@android_res_root) ->
+        IO.puts("  [plugin android] #{@android_res_root} not found — skipping plugin res files.")
+        :ok
+
+      true ->
+        raise_on_res_dest_collision!(res_files)
+        prior = read_plugin_artifact_ledger(:android_res)
+
+        written =
+          for %{src: src, dest: dest} <- res_files do
+            target = safe_res_target!(dest)
+            rel = Path.relative_to_cwd(target)
+
+            if File.exists?(target) and rel not in prior do
+              Mix.raise(
+                "plugin res file #{dest} would overwrite host-owned #{rel} — rename it in the plugin"
+              )
+            end
+
+            File.mkdir_p!(Path.dirname(target))
+            File.cp!(src, target)
+            IO.puts("  ✓ android res → #{rel}")
+            target
+          end
+
+        __prune_plugin_artifacts__(:android_res, written)
+        :ok
+    end
+  end
+
+  # Resolve a plugin res destination to a copy target, raising if it escapes the
+  # app `res/` dir. The hard security boundary behind the manifest validator's
+  # `..` rejection.
+  defp safe_res_target!(dest) do
+    case __res_target__(@android_res_root, dest) do
+      {:ok, target} ->
+        target
+
+      {:error, :escapes_res_dir} ->
+        Mix.raise(
+          "plugin res file destination escapes the app res/ dir: #{dest} " <>
+            "(path traversal — declared res_files must not contain \"..\")"
+        )
+    end
+  end
+
+  @doc false
+  # Pure: {:ok, copy_target} when `dest` (joined onto `root`) stays inside
+  # `root/res`, else {:error, :escapes_res_dir}. `..` and absolute escapes are
+  # normalised by Path.expand before the containment check.
+  @spec __res_target__(String.t(), String.t()) :: {:ok, String.t()} | {:error, :escapes_res_dir}
+  def __res_target__(root, dest) do
+    res_dir = Path.expand(Path.join(root, "res"))
+    target_abs = Path.expand(Path.join(root, dest))
+
+    if target_abs == res_dir or String.starts_with?(target_abs, res_dir <> "/"),
+      do: {:ok, Path.join(root, dest)},
+      else: {:error, :escapes_res_dir}
+  end
+
+  defp raise_on_res_dest_collision!(res_files) do
+    res_files
+    |> Enum.group_by(& &1.dest, & &1.src)
+    |> Enum.each(fn {dest, srcs} ->
+      case Enum.uniq(srcs) do
+        [_single] ->
+          :ok
+
+        many ->
+          Mix.raise(
+            "Android res collision: multiple plugins target #{dest}:\n  " <>
+              Enum.join(many, "\n  ") <> "\nRename one so plugin res files don't clash."
+          )
+      end
+    end)
+  end
+
+  # Copies each activated plugin's `bridge_kt` into the app's Kotlin sourceSet
+  # (at its own package path, read from the file's `package` line) so Gradle
+  # compiles it, and (re)generates `io.mob.plugin.MobPluginBootstrap` whose
+  # `registerAll(activity)` calls each `bridge_class`'s `register()` and then
+  # hands the Activity to any bridge implementing `MobActivityAware`.
+  # MainActivity calls `MobPluginBootstrap.registerAll(this)` in `onCreate`.
+  # The `MobActivityAware` contract is written alongside the bootstrap, and
+  # both are always written (empty registerAll body when no plugin declares a
+  # bridge_class) so the MainActivity call always resolves. No-op (with a
+  # notice) when the java root is missing.
+  defp apply_plugin_android_kotlin! do
+    if File.dir?(@android_java_root) do
+      activated = MobDev.Plugin.activated()
+
+      written =
+        Enum.flat_map(MobDev.Plugin.Merge.bridge_kt_sources(activated), fn src ->
+          case File.read(src) do
+            {:ok, content} ->
+              case __parse_kotlin_package__(content) do
+                nil ->
+                  IO.puts("  [plugin android] #{src} has no `package` line — skipping copy.")
+                  []
+
+                package ->
+                  dest = __bridge_kt_dest__(@android_java_root, package, Path.basename(src))
+                  File.mkdir_p!(Path.dirname(dest))
+                  File.write!(dest, content)
+                  [dest]
+              end
+
+            {:error, reason} ->
+              IO.puts("  [plugin android] cannot read #{src}: #{inspect(reason)} — skipping.")
+              []
+          end
+        end)
+
+      # Delete bridge .kt left in the sourceSet by plugins since removed — an
+      # orphaned bridge can break the Gradle compile. The generated glue below
+      # is overwritten at fixed paths each build, so only the per-plugin bridge
+      # copies (scattered by package) need ledger-tracked pruning.
+      __prune_plugin_artifacts__(:android_kotlin, written)
+
+      write_generated_kotlin!(@plugin_activity_aware_path, __activity_aware_kotlin__())
+      write_generated_kotlin!(@plugin_permission_provider_path, __permission_provider_kotlin__())
+      write_generated_kotlin!(@plugin_notify_hub_path, __notify_hub_kotlin__())
+
+      write_generated_kotlin!(
+        @plugin_bootstrap_path,
+        __bootstrap_kotlin__(MobDev.Plugin.Merge.bridge_classes(activated))
+      )
+
+      :ok
+    else
+      if MobDev.Plugin.Merge.bridge_kt_sources(MobDev.Plugin.activated()) != [] do
+        IO.puts("  [plugin android] #{@android_java_root} not found — skipping plugin Kotlin.")
+      end
+
+      :ok
+    end
+  end
+
+  # Extracts the FQ package from a Kotlin source, or nil if none.
+  @doc false
+  @spec __parse_kotlin_package__(String.t()) :: String.t() | nil
+  def __parse_kotlin_package__(content) do
+    case Regex.run(~r/^\s*package\s+([\w.]+)/m, content) do
+      [_, package] -> package
+      _ -> nil
+    end
+  end
+
+  @doc false
+  @spec __bridge_kt_dest__(String.t(), String.t(), String.t()) :: String.t()
+  def __bridge_kt_dest__(java_root, package, basename) do
+    Path.join([java_root, String.replace(package, ".", "/"), basename])
+  end
+
+  # Writes a generated Kotlin file, creating its dir and skipping the write
+  # when the content is byte-identical (keeps Gradle's up-to-date checks happy).
+  defp write_generated_kotlin!(path, content) do
+    File.mkdir_p!(Path.dirname(path))
+    if File.read(path) != {:ok, content}, do: File.write!(path, content)
+    :ok
+  end
+
+  # Source for io.mob.plugin.MobNotifyHub — see @plugin_notify_hub_path.
+  @doc false
+  @spec __notify_hub_kotlin__() :: String.t()
+  def __notify_hub_kotlin__ do
+    """
+    // GENERATED by mob_dev — do not edit. Stable cross-package seam for
+    // notification-delivery state: host delivery code (MobFirebaseService /
+    // MainActivity / NotificationReceiver, app package) and the mob_notify
+    // plugin bridge (io.mob.notify) both use it; neither can reference the
+    // other's generated package directly.
+    package io.mob.plugin
+
+    object MobNotifyHub {
+        // Local-notification channel id — the host NotificationReceiver posts
+        // to it; the plugin's notify_schedule creates it.
+        const val CHANNEL_ID = "mob_notifications"
+
+        // The screen process registered via MobNotify.register_push/1. Host
+        // delivery paths (FCM foreground push, notification tap) send to it
+        // via core's nativeDeliver* thunks; 0 = no screen registered.
+        @Volatile @JvmStatic var notifyPid: Long = 0
+
+        // FCM token that refreshed while no screen was registered; the
+        // plugin's notify_register_push drains it.
+        @Volatile @JvmStatic var pendingToken: String? = null
+    }
+    """
+  end
+
+  # Source for io.mob.plugin.MobPluginBootstrap. registerAll(activity) calls each
+  # bridge class's register(), then hands the Activity to any bridge implementing
+  # MobActivityAware via the handOff helper. The body is uniform per bridge, so
+  # the generator needs no per-plugin knowledge. handOff takes `Any` so the
+  # `as?` runtime check is valid for every bridge type — a direct
+  # `(SomeFinalObject as? MobActivityAware)` would draw a "cast can never
+  # succeed" warning for bridges that don't opt in.
+  @doc false
+  @spec __bootstrap_kotlin__([String.t()]) :: String.t()
+  def __bootstrap_kotlin__(bridge_classes) do
+    calls =
+      bridge_classes
+      |> Enum.map(fn cls ->
+        "        #{cls}.register()\n        handOff(#{cls}, activity)\n        collectPermissionProvider(#{cls})"
+      end)
+      |> Enum.join("\n")
+
+    {body, helpers} =
+      if calls == "" do
+        {"", ""}
+      else
+        {"\n" <> calls <> "\n    ",
+         "\n\n    // Hands the Activity to a bridge that opts in via" <>
+           " MobActivityAware.\n" <>
+           "    private fun handOff(bridge: Any, activity: Activity) {\n" <>
+           "        (bridge as? MobActivityAware)?.setActivity(activity)\n" <>
+           "    }\n\n" <>
+           "    // Records a bridge that opts in via MobPermissionProvider so" <>
+           " core\n" <>
+           "    // MobBridge.request_permission can fall through to it for a" <>
+           " capability\n" <>
+           "    // core no longer knows about.\n" <>
+           "    private fun collectPermissionProvider(bridge: Any) {\n" <>
+           "        (bridge as? MobPermissionProvider)?.let {\n" <>
+           "            if (!permissionProviders.contains(it)) permissionProviders.add(it)\n" <>
+           "        }\n" <>
+           "    }"}
+      end
+
+    """
+    // Generated by mob_dev (MobDev.NativeBuild) — do not edit.
+    // Calls each activated plugin's bridge-class register() at startup, then
+    // hands the Activity to any bridge implementing MobActivityAware and records
+    // any bridge implementing MobPermissionProvider; invoked from
+    // MainActivity.onCreate as registerAll(this).
+    package io.mob.plugin
+
+    import android.app.Activity
+
+    object MobPluginBootstrap {
+        private val permissionProviders = mutableListOf<MobPermissionProvider>()
+
+        @JvmStatic
+        fun registerAll(activity: Activity) {#{body}}
+
+        // Returns the first plugin-supplied Android permission mapping for `cap`,
+        // or null if no activated plugin provides this capability. Core
+        // MobBridge.request_permission consults this in its `else` branch.
+        @JvmStatic
+        fun permissionsFor(cap: String): Array<String>? {
+            for (provider in permissionProviders) {
+                val perms = provider.permissionsFor(cap)
+                if (perms != null) return perms
+            }
+            return null
+        }#{helpers}
+    }
+    """
+  end
+
+  # Source for io.mob.plugin.MobPermissionProvider — the stable opt-in contract a
+  # plugin bridge class implements to supply the cap->Android-permission-string
+  # mapping for a capability core no longer hardcodes. Generated (never changes)
+  # so existing apps and mob_new projects get it without a template edit.
+  @doc false
+  @spec __permission_provider_kotlin__() :: String.t()
+  def __permission_provider_kotlin__ do
+    """
+    // Generated by mob_dev (MobDev.NativeBuild) — do not edit.
+    // A plugin bridge class implements this to supply the Android permission
+    // strings for a capability; MobPluginBootstrap collects providers at
+    // registerAll and core MobBridge.request_permission consults them.
+    package io.mob.plugin
+
+    interface MobPermissionProvider {
+        // Return the Android permission strings for `cap`, or null if this
+        // provider does not handle the capability.
+        fun permissionsFor(cap: String): Array<String>?
+    }
+    """
+  end
+
+  # Source for io.mob.plugin.MobActivityAware — the stable opt-in contract a
+  # plugin bridge class implements to be handed the host Activity. Generated
+  # (never changes) so existing apps and mob_new projects get it without a
+  # template edit.
+  @doc false
+  @spec __activity_aware_kotlin__() :: String.t()
+  def __activity_aware_kotlin__ do
+    """
+    // Generated by mob_dev (MobDev.NativeBuild) — do not edit.
+    // A plugin bridge class implements this to receive the host Activity from
+    // MobPluginBootstrap.registerAll, right after register().
+    package io.mob.plugin
+
+    import android.app.Activity
+
+    interface MobActivityAware {
+        fun setActivity(activity: Activity)
+    }
+    """
+  end
+
+  @doc false
+  @spec __merge_android_permissions__(String.t(), [String.t()]) :: String.t()
+  def __merge_android_permissions__(manifest, permissions),
+    do: merge_android_permissions(manifest, permissions)
+
+  @doc false
+  @spec __merge_gradle_deps__(String.t(), [String.t()]) :: String.t()
+  def __merge_gradle_deps__(content, deps), do: merge_gradle_deps(content, deps)
+
+  @doc false
+  @spec __merge_android_manifest_components__(String.t(), [String.t()]) :: String.t()
+  def __merge_android_manifest_components__(manifest, snippets),
+    do: merge_android_manifest_components(manifest, snippets)
+
+  # Pure transform: splice each plugin `<application>` snippet (a <service>,
+  # <receiver>, …) in just before `</application>`. Idempotent per component:
+  # skips any snippet whose `android:name` (or, lacking one, whose trimmed body)
+  # is already present, so re-runs and hand-added copies don't duplicate. Each
+  # snippet's own indentation is preserved and shifted 8 spaces to sit inside
+  # <application>. No `</application>` → returns the manifest untouched rather
+  # than risk corrupting it.
+  # Managed-block markers (MobDev.Plugin.ManagedBlock) fence each plugin
+  # contribution so the region is regenerated every build and vanishes when the
+  # plugin is removed — the app manifest / build.gradle are host-owned and
+  # hand-edited, so there's no ledger to prune (unlike bridge_kt / res_files).
+  # Comment syntax matches the host file (XML for the manifest, `//` for Gradle).
+  @perm_markers {
+    "    <!-- mob:plugin-permissions BEGIN (managed — regenerated each build; do not edit) -->",
+    "    <!-- mob:plugin-permissions END -->"
+  }
+  @component_markers {
+    "        <!-- mob:plugin-components BEGIN (managed — regenerated each build; do not edit) -->",
+    "        <!-- mob:plugin-components END -->"
+  }
+  @gradle_dep_markers {
+    "    // mob:plugin-deps BEGIN (managed — regenerated each build; do not edit)",
+    "    // mob:plugin-deps END"
+  }
+
+  # Splice plugin `<application>` components (a `<service>`, `<receiver>`, …)
+  # into a managed region just before `</application>`. De-duped against
+  # host-authored content (post-strip) so a hand-declared component isn't
+  # doubled; removed automatically when no plugin contributes one (empty region
+  # → stripped).
+  defp merge_android_manifest_components(manifest, snippets) when is_binary(manifest) do
+    stripped = MobDev.Plugin.ManagedBlock.strip(manifest, @component_markers)
+    missing = Enum.reject(snippets, &manifest_component_present?(stripped, &1))
+    body = Enum.map_join(missing, "\n\n", &indent_manifest_snippet/1)
+
+    MobDev.Plugin.ManagedBlock.upsert(
+      manifest,
+      @component_markers,
+      body,
+      &place_before_application_close/2
+    )
+  end
+
+  defp place_before_application_close(stripped, region) do
+    if String.contains?(stripped, "</application>") do
+      MobDev.Plugin.ManagedBlock.insert_before(stripped, "</application>", region)
+    else
+      stripped
+    end
+  end
+
+  defp manifest_component_present?(manifest, snippet) do
+    case Regex.run(~r/android:name="([^"]+)"/, snippet) do
+      [_, name] -> String.contains?(manifest, ~s(android:name="#{name}"))
+      _ -> String.contains?(manifest, String.trim(snippet))
+    end
+  end
+
+  defp indent_manifest_snippet(snippet) do
+    snippet
+    |> String.trim("\n")
+    |> String.split("\n")
+    |> Enum.map_join("\n", fn
+      "" -> ""
+      line -> "        " <> line
+    end)
+  end
+
+  # Splice plugin `<uses-permission>` tags into a managed region before
+  # `<application` (or `</manifest>`). De-duped against host-authored content so
+  # a hand-declared permission isn't doubled; removed on plugin removal.
+  defp merge_android_permissions(manifest, permissions) when is_binary(manifest) do
+    stripped = MobDev.Plugin.ManagedBlock.strip(manifest, @perm_markers)
+    missing = Enum.reject(permissions, &permission_present?(stripped, &1))
+    body = Enum.map_join(missing, "\n", &~s(    <uses-permission android:name="#{&1}" />))
+    MobDev.Plugin.ManagedBlock.upsert(manifest, @perm_markers, body, &place_before_application/2)
+  end
+
+  defp permission_present?(manifest, permission) do
+    String.contains?(manifest, ~s(android:name="#{permission}")) and
+      String.contains?(manifest, "uses-permission")
+  end
+
+  defp place_before_application(stripped, region) do
+    cond do
+      String.contains?(stripped, "<application") ->
+        MobDev.Plugin.ManagedBlock.insert_before(stripped, "<application", region)
+
+      String.contains?(stripped, "</manifest>") ->
+        MobDev.Plugin.ManagedBlock.insert_before(stripped, "</manifest>", region)
+
+      true ->
+        # Pathological manifest (no <application and no </manifest>): append the
+        # region as whole lines at EOF so strip/2 still reverses it.
+        sep = if stripped == "" or String.ends_with?(stripped, "\n"), do: "", else: "\n"
+        stripped <> sep <> region <> "\n"
+    end
+  end
+
+  # Splice plugin `implementation "<dep>"` lines into a managed region inside the
+  # top-level `dependencies { }` block. Broad substring de-dupe against
+  # host-authored content (Gradle allows several syntaxes for one dep, so we'd
+  # rather under-add than duplicate); removed on plugin removal.
+  defp merge_gradle_deps(content, deps) when is_binary(content) do
+    stripped = MobDev.Plugin.ManagedBlock.strip(content, @gradle_dep_markers)
+    missing = Enum.reject(deps, &String.contains?(stripped, &1))
+    body = Enum.map_join(missing, "\n", &~s(    implementation "#{&1}"))
+
+    MobDev.Plugin.ManagedBlock.upsert(
+      content,
+      @gradle_dep_markers,
+      body,
+      &place_in_dependencies/2
+    )
+  end
+
+  # Insert the region just before the matching close-brace of the top-level
+  # `dependencies { ... }` block; fall back to a fresh appended block (Gradle
+  # merges multiple `dependencies {}` blocks) when it can't be located.
+  defp place_in_dependencies(stripped, region) do
+    case Regex.run(~r/^dependencies\s*\{/m, stripped, return: :index) do
+      [{start_idx, len}] ->
+        open_brace_idx = start_idx + len - 1
+
+        case find_matching_close_brace(stripped, open_brace_idx) do
+          {:ok, close_idx} ->
+            MobDev.Plugin.ManagedBlock.insert_before_index(stripped, close_idx, region)
+
+          :not_found ->
+            stripped <> "\ndependencies {\n#{region}\n}\n"
+        end
+
+      nil ->
+        stripped <> "\ndependencies {\n#{region}\n}\n"
+    end
+  end
+
+  # Given an index pointing at an opening `{` byte, return the index of the
+  # matching `}`. Operates on bytes — fine for Gradle files which are ASCII
+  # in practice; if a project sneaks in a UTF-8 brace-lookalike, we'd just
+  # miss it and fall back to the append path.
+  defp find_matching_close_brace(content, open_idx) do
+    scan_brace(content, open_idx + 1, 1)
+  end
+
+  defp scan_brace(content, idx, depth) when idx < byte_size(content) do
+    case binary_part(content, idx, 1) do
+      "{" -> scan_brace(content, idx + 1, depth + 1)
+      "}" when depth == 1 -> {:ok, idx}
+      "}" -> scan_brace(content, idx + 1, depth - 1)
+      _ -> scan_brace(content, idx + 1, depth)
+    end
+  end
+
+  defp scan_brace(_content, _idx, _depth), do: :not_found
 
   defp compile_ios_device_icons(app_path) do
     actool_plist =
@@ -3776,6 +8348,12 @@ defmodule MobDev.NativeBuild do
     if File.dir?(Path.join(otp_bundle, "python")),
       do: codesign_python_dylibs(otp_bundle, sign_identity)
 
+    # Sign embedded TFLite frameworks before signing the app bundle.
+    # iOS requires every nested .framework to carry its own signature;
+    # the app-level sign then includes the framework hashes in its
+    # sealed-resources list.
+    codesign_tflite_frameworks(app_path, sign_identity)
+
     {_, 0} =
       System.cmd(
         "codesign",
@@ -3791,6 +8369,59 @@ defmodule MobDev.NativeBuild do
         stderr_to_stdout: true,
         into: IO.stream()
       )
+
+    :ok
+  end
+
+  defp codesign_tflite_frameworks(app_path, sign_identity) do
+    frameworks_dir = Path.join(app_path, "Frameworks")
+
+    for fw_name <- ~w(TensorFlowLiteC TensorFlowLiteCCoreML TensorFlowLiteCMetal) do
+      fw_path = Path.join(frameworks_dir, "#{fw_name}.framework")
+
+      if File.dir?(fw_path) do
+        IO.puts("  === Signing #{fw_name}.framework")
+
+        # Sign the binary inside the framework first (deepest), then
+        # sign the framework dir itself. iOS 17+ rejects pre-existing
+        # CocoaPods-style signatures so --force overwrites any leftover.
+        # --generate-entitlement-der writes the modern entitlement
+        # encoding required by iOS 26.
+        binary = Path.join(fw_path, fw_name)
+
+        if File.exists?(binary) do
+          {_, 0} =
+            System.cmd(
+              "codesign",
+              [
+                "--force",
+                "--sign",
+                sign_identity,
+                "--timestamp=none",
+                "--generate-entitlement-der",
+                binary
+              ],
+              stderr_to_stdout: true,
+              into: IO.stream()
+            )
+        end
+
+        {_, 0} =
+          System.cmd(
+            "codesign",
+            [
+              "--force",
+              "--sign",
+              sign_identity,
+              "--timestamp=none",
+              "--generate-entitlement-der",
+              fw_path
+            ],
+            stderr_to_stdout: true,
+            into: IO.stream()
+          )
+      end
+    end
 
     :ok
   end
@@ -4129,8 +8760,8 @@ defmodule MobDev.NativeBuild do
   rely on the dep being added, or vendor pythonx some other way.
   """
   @spec pythonx_in_project?(String.t()) :: boolean()
-  def pythonx_in_project?(project_dir \\ File.cwd!()) do
-    File.dir?(Path.join([project_dir, "_build", "dev", "lib", "pythonx"]))
+  def pythonx_in_project?(_project_dir \\ File.cwd!()) do
+    dep_in_project?(:pythonx)
   end
 
   @doc """
@@ -4161,9 +8792,26 @@ defmodule MobDev.NativeBuild do
   bundle and adding `-Dmlx_static=true` to the iOS Zig build.
   """
   @spec emlx_in_project?(String.t()) :: boolean()
-  def emlx_in_project?(project_dir \\ File.cwd!()) do
-    File.dir?(Path.join([project_dir, "_build", "dev", "lib", "emlx"]))
+  def emlx_in_project?(_project_dir \\ File.cwd!()) do
+    dep_in_project?(:emlx)
   end
+
+  # The old detector checked `_build/dev/lib/<dep>` exists — a STALE build
+  # artifact (dep since removed) false-positived, e.g. triggering MLX bundle
+  # downloads (and their 404 noise) for apps that don't dep emlx at all.
+  # Mix.Project.deps_paths/0 is the dependency truth: hex + path + transitive,
+  # immune to leftover _build dirs.
+  defp dep_in_project?(name) do
+    __dep_in_project__(Mix.Project.deps_paths(), name)
+  rescue
+    # Outside a Mix project context, fall back to "not present".
+    _ -> false
+  end
+
+  @doc false
+  # Pure kernel, public for tests.
+  @spec __dep_in_project__(%{atom() => Path.t()}, atom()) :: boolean()
+  def __dep_in_project__(deps_paths, name), do: Map.has_key?(deps_paths, name)
 
   # Downloads the cross-compiled MLX bundle iff EMLX is a dep, for the given
   # target slice. Returns `{:ok, nil}` for projects without EMLX so the
@@ -4489,6 +9137,10 @@ defmodule MobDev.NativeBuild do
   @spec __resolve_elixir_lib__(String.t() | nil) :: String.t()
   def __resolve_elixir_lib__(configured), do: resolve_elixir_lib(configured)
 
+  @doc false
+  @spec __project_swift_sources_arg__(keyword()) :: String.t()
+  def __project_swift_sources_arg__(cfg), do: project_swift_sources_arg(cfg)
+
   defp load_config do
     config_file = Path.join(File.cwd!(), "mob.exs")
 
@@ -4511,16 +9163,126 @@ defmodule MobDev.NativeBuild do
     |> Keyword.put_new(:bundle_id, bundle_id)
   end
 
-  # Use the mob.exs value if it exists on disk; otherwise detect from the running BEAM.
+  # Use the mob.exs value if it exists on disk AND its Elixir version matches the
+  # running toolchain; otherwise detect from the running BEAM.
+  #
+  # WHY the version check: the app's .beam files are compiled by the toolchain
+  # that runs `mix` (System.version()). The bundled Elixir stdlib must be the
+  # SAME version, because macros baked into those BEAMs (Ecto.Migration, regex
+  # literals, …) emit calls into compiler internals that move between versions —
+  # e.g. `:elixir_quote.validate_quote/1` exists in 1.20.0 final but not in
+  # 1.20.0-rc.5. A stale mob.exs `elixir_lib` (rc.5) that still exists on disk
+  # would silently ship a mismatched stdlib; the skew is invisible until the app
+  # compiles an .exs at runtime on-device (a migration) and dies with `undef`.
+  # Android dodged this because its runtime sync auto-detects from the running
+  # BEAM; the iOS bundle path trusted the config. Prefer a correct build over an
+  # honored-but-stale config, and warn so the user fixes mob.exs.
   defp resolve_elixir_lib(configured) when is_binary(configured) do
     expanded = Path.expand(configured)
-    if File.exists?(expanded), do: configured, else: detect_elixir_lib()
+    exists? = File.exists?(expanded)
+
+    configured_vsn =
+      if exists? do
+        MobDev.AppFile.vsn_from_path(Path.join(expanded, "elixir/ebin/elixir.app"))
+      end
+
+    toolchain_vsn = System.version()
+
+    case __elixir_lib_decision__(exists?, configured_vsn, toolchain_vsn) do
+      {:use_configured} ->
+        configured
+
+      {:use_detected, reason} ->
+        detected = detect_elixir_lib()
+
+        if reason == :version_skew do
+          Mix.shell().info([
+            :yellow,
+            __elixir_lib_skew_warning__(configured, configured_vsn, toolchain_vsn, detected),
+            :reset
+          ])
+        end
+
+        detected
+    end
   end
 
   defp resolve_elixir_lib(_), do: detect_elixir_lib()
 
   defp detect_elixir_lib do
     :code.lib_dir(:elixir) |> to_string() |> Path.dirname()
+  end
+
+  @doc false
+  # Pure decision kernel for resolve_elixir_lib/1 — which lib dir to bundle.
+  #   exists?        — configured path present on disk
+  #   configured_vsn — Elixir version read from <lib>/elixir/ebin/elixir.app (nil if unreadable)
+  #   toolchain_vsn  — System.version(), the compiler that built the app's BEAMs
+  # Falls back to the auto-detected (running-BEAM) lib on a missing path or a
+  # version skew; honors an unreadable-but-present config (can't prove it wrong).
+  @spec __elixir_lib_decision__(boolean(), String.t() | nil, String.t()) ::
+          {:use_configured} | {:use_detected, :missing | :version_skew}
+  def __elixir_lib_decision__(false, _configured_vsn, _toolchain_vsn),
+    do: {:use_detected, :missing}
+
+  def __elixir_lib_decision__(true, nil, _toolchain_vsn), do: {:use_configured}
+  def __elixir_lib_decision__(true, vsn, vsn), do: {:use_configured}
+
+  def __elixir_lib_decision__(true, _configured_vsn, _toolchain_vsn),
+    do: {:use_detected, :version_skew}
+
+  @doc false
+  @spec __elixir_lib_skew_warning__(String.t(), String.t() | nil, String.t(), String.t()) ::
+          String.t()
+  def __elixir_lib_skew_warning__(configured, configured_vsn, toolchain_vsn, detected) do
+    """
+    * mob.exs elixir_lib is Elixir #{configured_vsn} but the active toolchain is \
+    #{toolchain_vsn}.
+        configured: #{configured}
+        A mismatched bundled stdlib causes on-device `undef` crashes when the app \
+    compiles .exs at runtime (e.g. Ecto migrations: :elixir_quote.validate_quote/1).
+        Bundling the toolchain's stdlib instead: #{detected}
+        Update mob.exs `elixir_lib` to silence this warning.
+    """
+  end
+
+  defp project_swift_sources_arg(cfg) do
+    cfg
+    |> Keyword.get(:project_swift_sources, [])
+    |> normalize_project_swift_sources!()
+    |> Enum.join(",")
+  end
+
+  defp normalize_project_swift_sources!(nil), do: []
+
+  defp normalize_project_swift_sources!(source) when is_binary(source) do
+    normalize_project_swift_sources!([source])
+  end
+
+  defp normalize_project_swift_sources!(sources) when is_list(sources) do
+    sources
+    |> Enum.map(&normalize_ios_swift_source!/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp normalize_project_swift_sources!(other) do
+    Mix.raise(
+      ":project_swift_sources must be a string or list of strings, got: #{inspect(other)}"
+    )
+  end
+
+  defp normalize_ios_swift_source!(source) when is_binary(source) do
+    source = String.trim(source)
+
+    if String.contains?(source, ",") do
+      Mix.raise(":project_swift_sources entries must not contain commas: #{inspect(source)}")
+    end
+
+    if source == "", do: "", else: Path.expand(source)
+  end
+
+  defp normalize_ios_swift_source!(other) do
+    Mix.raise(":project_swift_sources entries must be strings, got: #{inspect(other)}")
   end
 
   # ── Helpers ──────────────────────────────────────────────────────────────────

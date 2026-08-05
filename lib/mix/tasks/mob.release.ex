@@ -58,8 +58,9 @@ defmodule Mix.Tasks.Mob.Release do
     1. Ensures the Android OTP runtime is cached (`~/.mob/cache/otp-android-*`).
     2. Stages a temp tree: OTP runtime + app BEAMs + exqlite BEAMs.
     3. Runs `MobDev.OtpAssetBundle.build/2` to produce
-       `android/app/src/main/assets/otp.zip` — stripped and compressed.
-       `MobBridge.extractOtpIfNeeded()` extracts this on first launch.
+       `android/app/src/release/assets/otp.zip` — stripped and compressed.
+       `MobBridge.extractOtpIfNeeded()` extracts this on first launch. The
+       release-variant asset dir keeps this out of debug builds.
     4. Runs `./gradlew bundleRelease` to produce the signed AAB.
 
   Use `mix mob.publish --android` to upload to Google Play.
@@ -120,7 +121,7 @@ defmodule Mix.Tasks.Mob.Release do
 
     Mix.Task.run("compile")
 
-    case MobDev.ReleaseAndroid.build_aab() do
+    case MobDev.ReleaseAndroid.build_aab(slim: Keyword.get(opts, :slim, true)) do
       {:ok, path} ->
         Mix.shell().info("")
         Mix.shell().info("#{green()}✓ Release build complete#{reset()}")

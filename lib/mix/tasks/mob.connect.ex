@@ -15,6 +15,19 @@ defmodule Mix.Tasks.Mob.Connect do
     * `--no-iex`   — set up connections but don't start IEx (print node names instead)
     * `--name`     — local node name for this session (default: `mob_dev@127.0.0.1`)
     * `--cookie`   — Erlang cookie (default: `mob_secret`)
+    * `--ios-only` / `--android-only` — restrict discovery to one platform. iOS-only
+      development on a Mac with no Android platform-tools installed works without
+      this flag (adb's absence is handled gracefully), but `--ios-only` skips the
+      Android scan entirely — useful when a phone for another project is plugged in.
+      To make it the default for a project, set it once in `mob.exs`:
+
+          config :mob_dev, platforms: [:ios]
+    * `--only` / `--device` (`-d`) — restrict to devices whose serial/udid contains
+      the given substring. Repeatable. Without it, connect attaches to *every*
+      running device, so a single slow or locked device (e.g. a plugged-in
+      physical iPhone) can stall the whole run. Target one phone with:
+
+          mix mob.connect --only ZY22CRLMWK
 
   ## Multiple simultaneous sessions
 
@@ -111,17 +124,39 @@ defmodule Mix.Tasks.Mob.Connect do
   def run(args) do
     {opts, _, _} =
       OptionParser.parse(args,
-        switches: [iex: :boolean, cookie: :string, name: :string],
-        aliases: [c: :cookie, n: :name]
+        switches: [
+          iex: :boolean,
+          cookie: :string,
+          name: :string,
+          only: :keep,
+          device: :keep,
+          ios_only: :boolean,
+          android_only: :boolean
+        ],
+        aliases: [c: :cookie, n: :name, d: :device]
       )
 
     no_iex = Keyword.get(opts, :iex, true) == false
     cookie = opts |> Keyword.get(:cookie, "mob_secret") |> String.to_atom()
     local_name = opts |> Keyword.get(:name, "mob_dev@127.0.0.1") |> String.to_atom()
+    # --only / --device (repeatable) restrict to matching serials/udids. Without
+    # it, connect attaches to every running device — handy for a cluster, but a
+    # slow or locked device (e.g. a physical iPhone) can stall the whole run.
+    only = Keyword.get_values(opts, :only) ++ Keyword.get_values(opts, :device)
 
     Mix.Task.run("app.config")
 
-    {connected, _failed} = MobDev.Connector.connect_all(cookie: cookie)
+    # Platform filter: --ios-only / --android-only override the mob.exs default
+    # (`config :mob_dev, platforms: [...]`). An iOS-only Mac with no adb skips
+    # Android discovery entirely rather than crashing on the missing binary.
+    platforms =
+      case resolve_platforms(opts, MobDev.Config.platforms()) do
+        {:ok, platforms} -> platforms
+        {:error, message} -> Mix.raise(message)
+      end
+
+    {connected, _failed} =
+      MobDev.Connector.connect_all(cookie: cookie, only: only, platforms: platforms)
 
     if connected == [] do
       IO.puts("\n#{IO.ANSI.yellow()}No nodes connected. Nothing to do.#{IO.ANSI.reset()}\n")
@@ -133,6 +168,36 @@ defmodule Mix.Tasks.Mob.Connect do
       else
         start_iex(connected, cookie, local_name)
       end
+    end
+  end
+
+  @doc """
+  Resolves which platforms to discover from the parsed options and the
+  `mob.exs` default.
+
+  `--ios-only` / `--android-only` win over the default; passing both is a
+  contradiction and returns `{:error, _}`. With neither flag, the `mob.exs`
+  default (`config :mob_dev, platforms: [...]`, both platforms when unset) is
+  used. Pure — exposed for testing.
+  """
+  @spec resolve_platforms(keyword(), [:android | :ios]) ::
+          {:ok, [:android | :ios]} | {:error, String.t()}
+  def resolve_platforms(opts, default) do
+    ios_only = Keyword.get(opts, :ios_only, false)
+    android_only = Keyword.get(opts, :android_only, false)
+
+    cond do
+      ios_only and android_only ->
+        {:error, "Cannot combine --ios-only and --android-only."}
+
+      ios_only ->
+        {:ok, [:ios]}
+
+      android_only ->
+        {:ok, [:android]}
+
+      true ->
+        {:ok, default}
     end
   end
 
@@ -157,9 +222,21 @@ defmodule Mix.Tasks.Mob.Connect do
     end)
 
     # Hand off to IEx in this process — tunnels stay alive via adb daemon.
-    # `IEx.Server.run/1` is the documented programmatic-start surface
-    # (added in 1.8.0). The old `IEx.start/0` was internal and removed
-    # in 1.20-rc.4.
+    ensure_iex_started()
+    # IEx.Server.run/1 is the 1.20 programmatic-start surface (IEx.start/0
+    # was removed in 1.20-rc.4); ensure_iex_started/0 above is the actual fix.
     IEx.Server.run([])
+  end
+
+  @doc false
+  @spec ensure_iex_started() :: :ok
+  def ensure_iex_started do
+    case Application.ensure_all_started(:iex) do
+      {:ok, _apps} ->
+        :ok
+
+      {:error, {app, reason}} ->
+        Mix.raise("Failed to start #{inspect(app)} before launching IEx: #{inspect(reason)}")
+    end
   end
 end
