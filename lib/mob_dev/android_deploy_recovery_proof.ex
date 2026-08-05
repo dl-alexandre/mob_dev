@@ -169,6 +169,25 @@ defmodule MobDev.AndroidDeployRecoveryProof do
     :ok
   end
 
+  @doc false
+  @spec __test_only__(:resolve_apksigner, binary(), (binary() -> binary() | nil)) ::
+          binary() | nil
+  def __test_only__(:resolve_apksigner, project_dir, path_lookup)
+      when is_binary(project_dir) and is_function(path_lookup, 1) do
+    resolve_apksigner(project_dir, path_lookup)
+  end
+
+  @doc false
+  @spec __test_only__(:verify_apk_signature, binary(), keyword()) :: boolean()
+  def __test_only__(:verify_apk_signature, apk_path, opts)
+      when is_binary(apk_path) and is_list(opts) do
+    project_dir = Keyword.fetch!(opts, :project_dir)
+    path_lookup = Keyword.fetch!(opts, :path_lookup)
+    runner = Keyword.fetch!(opts, :runner)
+
+    apk_signature_verified?(apk_path, project_dir, path_lookup, runner)
+  end
+
   defp payload_identity(%{
          version: 1,
          package: bundle_id,
@@ -336,11 +355,69 @@ defmodule MobDev.AndroidDeployRecoveryProof do
   end
 
   defp apk_signature_verified?(apk_path) do
-    with executable when is_binary(executable) <- System.find_executable("apksigner"),
-         {_output, 0} <- System.cmd(executable, ["verify", "--print-certs", apk_path]) do
+    apk_signature_verified?(
+      apk_path,
+      File.cwd!(),
+      &System.find_executable/1,
+      &System.cmd/3
+    )
+  end
+
+  defp apk_signature_verified?(apk_path, project_dir, path_lookup, runner) do
+    with executable when is_binary(executable) <- resolve_apksigner(project_dir, path_lookup),
+         {_discarded_output, 0} <-
+           runner.(executable, ["verify", "--print-certs", apk_path], stderr_to_stdout: true) do
       true
     else
       _unavailable_or_invalid -> false
+    end
+  rescue
+    _error -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  defp resolve_apksigner(project_dir, path_lookup) do
+    case path_lookup.("apksigner") do
+      executable when is_binary(executable) -> executable
+      _not_on_path -> sdk_apksigner(project_dir)
+    end
+  rescue
+    _error -> nil
+  catch
+    _kind, _reason -> nil
+  end
+
+  defp sdk_apksigner(project_dir) do
+    with {:ok, sdk_dir} <- MobDev.NativeBuild.read_sdk_dir(project_dir),
+         {:ok, entries} <- File.ls(Path.join(sdk_dir, "build-tools")) do
+      entries
+      |> Enum.flat_map(fn entry ->
+        case Version.parse(entry) do
+          {:ok, version} -> [{version, entry}]
+          :error -> []
+        end
+      end)
+      |> Enum.sort(fn {left_version, left_entry}, {right_version, right_entry} ->
+        case Version.compare(left_version, right_version) do
+          :gt -> true
+          :lt -> false
+          :eq -> left_entry >= right_entry
+        end
+      end)
+      |> Enum.find_value(fn {_version, entry} ->
+        candidate = Path.join([sdk_dir, "build-tools", entry, "apksigner"])
+        if executable_file?(candidate), do: candidate
+      end)
+    else
+      _unavailable -> nil
+    end
+  end
+
+  defp executable_file?(path) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, mode: mode}} -> Bitwise.band(mode, 0o111) != 0
+      _missing_or_not_regular -> false
     end
   end
 
