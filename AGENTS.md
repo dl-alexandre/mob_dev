@@ -141,6 +141,8 @@ narrowing functions). Don't make them private:
 - `AndroidDeployLock.valid?/2`, `acquire/4`, `verify_owner/3`, `transition/4`,
   `release/2`, `status/3`, and `cleanup_committed_tombstone/3` (the shared,
   exact-target Android mutation lease and its bounded recovery surface)
+- `AndroidDeployRecoveryProof.host_lock_status/1` (privacy-safe, read-only
+  recovery-host-lock status; never expose the owner record or identifiers)
 - `HotPush.prepare/1`, `push_prepared/2`, `push_prepared/3`,
   `validate_prepared_snapshot/1`, and `push_prepared_fenced/3` (immutable BEAM
   snapshot and lease-fenced RPC seams; raw Android pushes intentionally reject)

@@ -315,6 +315,150 @@ defmodule MobDev.AndroidDeployRecoveryProofTest do
     end
   end
 
+  describe "privacy-safe host lock status" do
+    test "reports an active same-boot, same-start, same-VM owner without identifiers" do
+      assert :ok =
+               AndroidDeployRecoveryProof.with_host_lock(@bundle, fn ->
+                 assert {:ok, status} = AndroidDeployRecoveryProof.host_lock_status(@bundle)
+                 assert status.state == :held
+                 assert status.reason == :same_vm_live
+                 assert status.current_boot_match? == true
+                 assert status.process_alive? == true
+                 assert status.process_start_match? == true
+                 assert status.same_vm? == true
+                 assert status.age_bucket in [:under_minute, :under_five_minutes]
+
+                 assert Map.keys(status) |> Enum.sort() ==
+                          Enum.sort([
+                            :age_bucket,
+                            :current_boot_match?,
+                            :process_alive?,
+                            :process_start_match?,
+                            :reason,
+                            :same_vm?,
+                            :state
+                          ])
+
+                 :ok
+               end)
+    end
+
+    test "classifies boot, process, start, and live other-VM fences with fixed values" do
+      cases = [
+        {:same_vm_dead, :stale, :beam_process_dead, true, false, true, true},
+        {:boot_id, :stale, :boot_mismatch, false, :unknown, :unknown, true},
+        {:os_start, :stale, :process_start_mismatch, true, true, false, false},
+        {:os_pid, :stale, :process_missing, true, false, :unknown, false},
+        {:vm_id, :held, :other_vm_live, true, true, true, false}
+      ]
+
+      for {field, state, reason, boot_match?, alive?, start_match?, same_vm?} <- cases do
+        leave_stale_local_lock!()
+        owner_path = lock_owner_path()
+        owner = owner_path |> File.read!() |> :erlang.binary_to_term([:safe])
+
+        changed =
+          case field do
+            :same_vm_dead ->
+              owner
+
+            :boot_id ->
+              %{owner | boot_id: String.duplicate("f", 64)}
+
+            :os_start ->
+              %{owner | os_start: "definitely-different", vm_id: String.duplicate("e", 64)}
+
+            :os_pid ->
+              %{owner | os_pid: 2_147_483_647, vm_id: String.duplicate("d", 64)}
+
+            :vm_id ->
+              %{owner | vm_id: String.duplicate("c", 64)}
+          end
+
+        File.write!(owner_path, :erlang.term_to_binary(changed))
+        owner_bytes = File.read!(owner_path)
+        lock_listing = File.ls!(Path.dirname(owner_path))
+
+        assert {:ok, status} = AndroidDeployRecoveryProof.host_lock_status(@bundle)
+        assert status.state == state
+        assert status.reason == reason
+        assert status.current_boot_match? == boot_match?
+        assert status.process_alive? == alive?
+        assert status.process_start_match? == start_match?
+        assert status.same_vm? == same_vm?
+        assert status.age_bucket in [:under_minute, :under_five_minutes]
+
+        assert Map.keys(status) |> Enum.sort() ==
+                 Enum.sort([
+                   :age_bucket,
+                   :current_boot_match?,
+                   :process_alive?,
+                   :process_start_match?,
+                   :reason,
+                   :same_vm?,
+                   :state
+                 ])
+
+        assert File.read!(owner_path) == owner_bytes
+        assert File.ls!(Path.dirname(owner_path)) == lock_listing
+        remove_host_lock!()
+      end
+    end
+
+    test "reports absent and malformed records without mutation or reflection" do
+      assert {:ok, absent} = AndroidDeployRecoveryProof.host_lock_status(@bundle)
+      assert absent.state == :absent
+      assert absent.reason == :none
+
+      secret = "lock-secret-#{System.unique_integer([:positive])}"
+      path = AndroidDeployRecoveryProof.__test_only__(:lock_path, @bundle)
+      File.mkdir!(path)
+      File.write!(Path.join(path, "owner.term"), secret)
+      before = File.read!(Path.join(path, "owner.term"))
+
+      logs =
+        capture_log(fn ->
+          output =
+            capture_io(fn ->
+              send(self(), {:status, AndroidDeployRecoveryProof.host_lock_status(@bundle)})
+            end)
+
+          send(self(), {:status_output, output})
+        end)
+
+      assert_receive {:status, {:ok, status}}
+      assert status.state == :ambiguous
+      assert status.reason == :malformed
+      assert_receive {:status_output, output}
+      refute inspect(status) =~ secret
+      refute output =~ secret
+      refute logs =~ secret
+      assert File.read!(Path.join(path, "owner.term")) == before
+      remove_host_lock!()
+    end
+
+    test "reports an unreadable owner without mutation or reflection" do
+      path = AndroidDeployRecoveryProof.__test_only__(:lock_path, @bundle)
+      owner_path = Path.join(path, "owner.term")
+      File.mkdir_p!(owner_path)
+      before = File.ls!(path)
+
+      assert {:ok, status} = AndroidDeployRecoveryProof.host_lock_status(@bundle)
+      assert status.state == :ambiguous
+      assert status.reason == :unreadable
+      assert File.ls!(path) == before
+      assert File.dir?(owner_path)
+
+      File.rmdir!(owner_path)
+      File.rmdir!(path)
+    end
+
+    test "rejects invalid bundle identity without filesystem access" do
+      assert {:error, :invalid_bundle_id} =
+               AndroidDeployRecoveryProof.host_lock_status("../unsafe")
+    end
+  end
+
   test "operation-wide host lock is exclusive and remains held for the callback" do
     assert :ok =
              AndroidDeployRecoveryProof.with_host_lock(@bundle, fn ->
@@ -519,6 +663,12 @@ defmodule MobDev.AndroidDeployRecoveryProofTest do
   defp lock_owner_path do
     AndroidDeployRecoveryProof.__test_only__(:lock_path, @bundle)
     |> Path.join("owner.term")
+  end
+
+  defp remove_host_lock! do
+    path = AndroidDeployRecoveryProof.__test_only__(:lock_path, @bundle)
+    File.rm(Path.join(path, "owner.term"))
+    File.rmdir(path)
   end
 
   defp payload(apk) do
