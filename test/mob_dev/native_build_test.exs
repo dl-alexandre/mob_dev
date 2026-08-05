@@ -2725,7 +2725,6 @@ defmodule MobDev.NativeBuildTest do
                  cleanup,
                  resume_native_ready: true,
                  android_recovery_opts: [
-                   payload_validator: fn _plan -> :ok end,
                    host_lock_held?: fn -> true end,
                    apk_signature_verified?: fn _path -> true end
                  ]
@@ -2744,6 +2743,41 @@ defmodule MobDev.NativeBuildTest do
                _command ->
                  false
              end)
+    end
+
+    test "recovery validates the immutable plan without requiring its discarded source path", %{
+      tmp_dir: dir
+    } do
+      fixture = authoritative_android_fixture!(dir, ["serial-a"])
+      apk_identity = authoritative_android_file_identity!(fixture.apk)
+
+      input = %{
+        apk: fixture.apk,
+        apk_size: apk_identity.size,
+        apk_sha256: apk_identity.sha256,
+        bundle_id: fixture.package,
+        serials: fixture.serials,
+        selected_abis: ["arm64-v8a"],
+        selected_abis_by_serial: %{"serial-a" => "arm64-v8a"}
+      }
+
+      plan = authoritative_android_payload_plan!(dir, input)
+
+      selections = %{
+        "serial-a" => %{abi: "arm64-v8a", otp_dir: fixture.otp_arm64}
+      }
+
+      assert {:error, :invalid_recovery_payload} =
+               NativeBuild.validate_android_recovery_payload(plan)
+
+      assert :ok = NativeBuild.validate_android_recovery_payload(plan, selections)
+
+      assert {:error, :invalid_recovery_payload} =
+               NativeBuild.validate_android_recovery_payload(plan, %{
+                 "serial-a" => %{abi: "arm64-v8a"}
+               })
+
+      assert cleanup_authoritative_android_plan(plan) == :ok
     end
 
     test "canonicalizes one unsorted target set before planning and every mutation", %{

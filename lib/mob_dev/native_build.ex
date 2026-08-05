@@ -1788,6 +1788,9 @@ defmodule MobDev.NativeBuild do
         opts
         |> Keyword.get(:android_recovery_opts, [])
         |> Keyword.put(:runtime_provenance, runtime_provenance)
+        |> Keyword.put(:payload_validator, fn plan ->
+          validate_android_recovery_payload(plan, selections)
+        end)
 
       case AndroidDeployRecoveryProof.resume(payload_plan, adb_runner, recovery_opts) do
         {:ok, lease} ->
@@ -1875,6 +1878,24 @@ defmodule MobDev.NativeBuild do
   @doc false
   @spec validate_android_recovery_payload(map()) :: :ok | {:error, :invalid_recovery_payload}
   def validate_android_recovery_payload(payload_plan) when is_map(payload_plan) do
+    validate_android_recovery_payload_plan(payload_plan, nil)
+  end
+
+  def validate_android_recovery_payload(_payload_plan),
+    do: {:error, :invalid_recovery_payload}
+
+  @doc false
+  @spec validate_android_recovery_payload(map(), map()) ::
+          :ok | {:error, :invalid_recovery_payload}
+  def validate_android_recovery_payload(payload_plan, selections)
+      when is_map(payload_plan) and is_map(selections) do
+    validate_android_recovery_payload_plan(payload_plan, selections)
+  end
+
+  def validate_android_recovery_payload(_payload_plan, _selections),
+    do: {:error, :invalid_recovery_payload}
+
+  defp validate_android_recovery_payload_plan(payload_plan, selections) do
     with %{
            version: 1,
            package: package,
@@ -1892,18 +1913,26 @@ defmodule MobDev.NativeBuild do
            apk_size: apk_size,
            apk_sha256: apk_sha256
          },
-         {:ok, ^payload_plan} <- validate_android_payload_plan(payload_plan, input),
+         {:ok, ^payload_plan} <-
+           validate_android_payload_plan(payload_plan, input, require_distinct_apk_source?: false),
          :ok <- validate_android_local_file_identity(payload_plan.apk, @max_android_apk_bytes),
-         selections <- Map.new(selected_by_serial, fn {serial, abi} -> {serial, %{abi: abi}} end),
-         :ok <- validate_android_apk_runtime(apk_path, selections, payload_plan) do
+         :ok <- maybe_validate_android_recovery_runtime(apk_path, selections, payload_plan) do
       :ok
     else
       _invalid_or_changed -> {:error, :invalid_recovery_payload}
     end
+  rescue
+    _error -> {:error, :invalid_recovery_payload}
+  catch
+    _kind, _reason -> {:error, :invalid_recovery_payload}
   end
 
-  def validate_android_recovery_payload(_payload_plan),
-    do: {:error, :invalid_recovery_payload}
+  defp maybe_validate_android_recovery_runtime(_apk_path, nil, _payload_plan),
+    do: {:error, :runtime_selections_required}
+
+  defp maybe_validate_android_recovery_runtime(apk_path, selections, payload_plan) do
+    validate_android_apk_runtime(apk_path, selections, payload_plan)
+  end
 
   defp snapshot_android_apk(apk, opts) when is_binary(apk) do
     tmp_root = Keyword.get(opts, :tmp_root, System.tmp_dir!())
@@ -2000,7 +2029,9 @@ defmodule MobDev.NativeBuild do
     end
   end
 
-  defp validate_android_payload_plan(payload_plan, input)
+  defp validate_android_payload_plan(payload_plan, input, opts \\ [])
+
+  defp validate_android_payload_plan(payload_plan, input, opts)
        when is_map(payload_plan) and is_map(input) do
     with true <-
            exact_map_keys?(payload_plan, [
@@ -2021,7 +2052,7 @@ defmodule MobDev.NativeBuild do
          true <- payload_plan.selected_abis == input.selected_abis,
          true <- payload_plan.selected_abis_by_serial == input.selected_abis_by_serial,
          true <- valid_android_attempt_id?(payload_plan.attempt_id),
-         :ok <- validate_android_plan_apk(payload_plan.apk, input),
+         :ok <- validate_android_plan_apk(payload_plan.apk, input, opts),
          :ok <-
            validate_android_beam_plan(
              payload_plan.beam,
@@ -2048,7 +2079,7 @@ defmodule MobDev.NativeBuild do
     end
   end
 
-  defp validate_android_payload_plan(_payload_plan, _input),
+  defp validate_android_payload_plan(_payload_plan, _input, _opts),
     do: {:error, "Authoritative Android payload plan identity is invalid"}
 
   defp exact_map_keys?(map, keys) do
@@ -2062,9 +2093,11 @@ defmodule MobDev.NativeBuild do
 
   defp valid_android_attempt_id?(_attempt_id), do: false
 
-  defp validate_android_plan_apk(apk, input) do
+  defp validate_android_plan_apk(apk, input, opts) do
+    require_distinct_source? = Keyword.get(opts, :require_distinct_apk_source?, true)
+
     with :ok <- validate_android_local_file_identity(apk, @max_android_apk_bytes),
-         true <- apk.path != input.apk,
+         true <- not require_distinct_source? or apk.path != input.apk,
          true <- apk.size == input.apk_size,
          true <- apk.sha256 == input.apk_sha256 do
       :ok
