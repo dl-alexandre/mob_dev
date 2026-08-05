@@ -22,6 +22,8 @@ defmodule MobDev.AndroidDeployRecoveryTest do
     assert lease.serials == [@serial]
     assert_receive {:command, cas_command}
     assert cas_command =~ "test \"$value\" = \"#{proof.record}\""
+    assert cas_command =~ "case \"$value\" in \"1|#{@old_owner}|\"*)"
+    refute cas_command =~ "${value#"
     assert cas_command =~ "record_next_#{@new_owner}"
     refute cas_command =~ "rm "
     refute cas_command =~ "rm -rf"
@@ -99,6 +101,52 @@ defmodule MobDev.AndroidDeployRecoveryTest do
                end,
                owner: @new_owner
              )
+  end
+
+  test "portable case guard is accepted by an Android-compatible shell grammar" do
+    AndroidDeployRecovery.resume(proof(), runner(self()), owner: @new_owner)
+    assert_receive {:command, command}
+
+    assert command =~
+             "case \"$value\" in \"1|#{@old_owner}|\"*) ;; *) exit 1 ;; esac;"
+
+    refute command =~ "${value#"
+    refute command =~ "${value##"
+
+    guard =
+      "value=\"$1\"; case \"$value\" in \"1|#{@old_owner}|\"*) exit 0 ;; *) exit 1 ;; esac"
+
+    assert {"", 0} = System.cmd("/bin/sh", ["-c", guard, "recovery-prefix", proof().record])
+
+    assert {"", 1} =
+             System.cmd("/bin/sh", [
+               "-c",
+               guard,
+               "recovery-prefix",
+               "1|differentowner01|#{target_digest()}|native_ready"
+             ])
+  end
+
+  test "ambiguous CAS leaves the observed record unchanged and does not reflect runner output" do
+    original_record = proof().record
+    state = start_supervised!({Agent, fn -> original_record end})
+    secret_runner_output = "private-runner-detail-must-not-reflect"
+
+    result =
+      AndroidDeployRecovery.resume(
+        proof(),
+        fn ["-s", @serial, "shell", command] ->
+          assert command =~ "case \"$value\" in"
+          {secret_runner_output, 1}
+        end,
+        owner: @new_owner
+      )
+
+    assert {:error, :recovery_cas_ambiguous,
+            %{owner: @new_owner, phase: :native_ready, state: :retained_ambiguous}} = result
+
+    assert Agent.get(state, & &1) == original_record
+    refute inspect(result) =~ secret_runner_output
   end
 
   defp proof do

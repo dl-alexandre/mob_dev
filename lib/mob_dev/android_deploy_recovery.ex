@@ -146,7 +146,7 @@ defmodule MobDev.AndroidDeployRecovery do
       "test \"$entries\" -eq 1; test -f #{fixed}/record; " <>
       "size=$(wc -c < #{fixed}/record); test \"$size\" -eq #{size}; " <>
       "value=$(cat #{fixed}/record); test \"$value\" = \"#{proof.record}\"; " <>
-      "test \"${value#1|#{old_owner}|}\" != \"$value\"; " <>
+      "case \"$value\" in \"1|#{old_owner}|\"*) ;; *) exit 1 ;; esac; " <>
       "test ! -e #{next_file}; printf %s \"#{next_record}\" > #{next_file}; " <>
       "mv #{next_file} #{fixed}/record'"
   end
