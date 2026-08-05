@@ -158,6 +158,24 @@ defmodule MobDev.AndroidDeployRecoveryProof do
 
   def with_host_lock(_bundle_id, _operation), do: {:error, :recovery_host_lock_unavailable}
 
+  @doc """
+  Returns a privacy-safe, read-only status for the Android recovery host lock.
+
+  The result contains only fixed enums, booleans, and a coarse age bucket. It
+  never exposes the lock path, owner record, process identifiers, timestamps,
+  VM identifiers, or command text.
+  """
+  @spec host_lock_status(binary()) :: {:ok, map()} | {:error, :invalid_bundle_id}
+  def host_lock_status(bundle_id) when is_binary(bundle_id) do
+    if Regex.match?(~r/\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+\z/, bundle_id) do
+      read_host_lock_status(host_lock_path(bundle_id))
+    else
+      {:error, :invalid_bundle_id}
+    end
+  end
+
+  def host_lock_status(_bundle_id), do: {:error, :invalid_bundle_id}
+
   @doc false
   @spec __test_only__(:lock_path, binary()) :: binary()
   def __test_only__(:lock_path, bundle_id), do: host_lock_path(bundle_id)
@@ -521,32 +539,107 @@ defmodule MobDev.AndroidDeployRecoveryProof do
   end
 
   defp owner_liveness(owner, current) do
+    owner_liveness_status(owner, current).state
+  end
+
+  defp owner_liveness_status(owner, current) do
     cond do
       owner.boot_id != current.boot_id ->
-        :stale
+        status(:stale, :boot_mismatch, false, :unknown, :unknown, owner.vm_id == current.vm_id)
 
       owner.vm_id == current.vm_id ->
-        local_owner_liveness(owner)
+        local_owner_liveness_status(owner)
 
       true ->
-        os_owner_liveness(owner)
+        os_owner_liveness_status(owner)
     end
   end
 
-  defp local_owner_liveness(owner) do
+  defp local_owner_liveness_status(owner) do
     with {:ok, pid} <- local_pid(owner.beam_pid) do
-      if Process.alive?(pid), do: :held, else: :stale
+      if Process.alive?(pid) do
+        status(:held, :same_vm_live, true, true, true, true)
+      else
+        status(:stale, :beam_process_dead, true, false, true, true)
+      end
     else
-      _invalid -> :ambiguous
+      _invalid -> status(:ambiguous, :malformed, true, :unknown, true, true)
     end
   end
 
-  defp os_owner_liveness(owner) do
+  defp os_owner_liveness_status(owner) do
     case os_process_start(owner.os_pid) do
-      {:ok, start} when start == owner.os_start -> :held
-      {:ok, _reused_pid} -> :stale
-      {:error, :not_found} -> :stale
-      {:error, _reason} -> :ambiguous
+      {:ok, start} when start == owner.os_start ->
+        status(:held, :other_vm_live, true, true, true, false)
+
+      {:ok, _reused_pid} ->
+        status(:stale, :process_start_mismatch, true, true, false, false)
+
+      {:error, :not_found} ->
+        status(:stale, :process_missing, true, false, :unknown, false)
+
+      {:error, _reason} ->
+        status(:ambiguous, :unreadable, true, :unknown, :unknown, false)
+    end
+  end
+
+  defp read_host_lock_status(path) do
+    age_bucket = lock_age_bucket(path)
+
+    case read_lock_owner(Path.join(path, @lock_owner_file)) do
+      {:ok, owner} ->
+        case current_lock_owner() do
+          {:ok, current} ->
+            details = owner_liveness_status(owner, current)
+            {:ok, Map.put(details, :age_bucket, age_bucket)}
+
+          {:error, _reason} ->
+            {:ok,
+             status(:ambiguous, :unreadable, :unknown, :unknown, :unknown, :unknown, age_bucket)}
+        end
+
+      {:error, :enoent} ->
+        {:ok, status(:absent, :none, :unknown, :unknown, :unknown, :unknown, :absent)}
+
+      {:error, :invalid} ->
+        {:ok, status(:ambiguous, :malformed, :unknown, :unknown, :unknown, :unknown, age_bucket)}
+
+      {:error, _reason} ->
+        {:ok, status(:ambiguous, :unreadable, :unknown, :unknown, :unknown, :unknown, age_bucket)}
+    end
+  end
+
+  defp status(
+         state,
+         reason,
+         boot_match?,
+         process_alive?,
+         process_start_match?,
+         same_vm?,
+         age \\ :unknown
+       ) do
+    %{
+      state: state,
+      reason: reason,
+      current_boot_match?: boot_match?,
+      process_alive?: process_alive?,
+      process_start_match?: process_start_match?,
+      same_vm?: same_vm?,
+      age_bucket: age
+    }
+  end
+
+  defp lock_age_bucket(path) do
+    with {:ok, %{mtime: mtime}} <- File.stat(path, time: :posix),
+         age when is_integer(age) <- max(System.os_time(:second) - mtime, 0) do
+      cond do
+        age < 60 -> :under_minute
+        age < 300 -> :under_five_minutes
+        age < 3_600 -> :under_hour
+        true -> :older
+      end
+    else
+      _unavailable -> :unknown
     end
   end
 
