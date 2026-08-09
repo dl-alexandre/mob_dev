@@ -196,4 +196,73 @@ defmodule Mix.Tasks.Mob.ProvisionTest do
       assert err.message =~ "APP_STORE_CONNECT_API_KEY_PATH"
     end
   end
+
+  describe "project_pbxproj/4 configuration entitlement contracts" do
+    @team "TEAMFAKE01"
+    @bundle "com.example.fake-app"
+    @profile "iOS Team Store Provisioning Profile: com.example.fake-app"
+
+    test "Debug uses development entitlements; Release uses distribution entitlements" do
+      project =
+        Provision.project_pbxproj(
+          @bundle,
+          @team,
+          @profile,
+          %{debug: "App.entitlements", release: "App.Release.entitlements"}
+        )
+
+      debug_cfg = configuration_block(project, "AA00000B /* Debug */")
+      release_cfg = configuration_block(project, "AA00000C /* Release */")
+
+      assert debug_cfg =~ "CODE_SIGN_STYLE = Automatic;"
+      assert debug_cfg =~ "CODE_SIGN_ENTITLEMENTS = App.entitlements;"
+      refute debug_cfg =~ "CODE_SIGN_ENTITLEMENTS = App.Release.entitlements;"
+      refute debug_cfg =~ "Apple Distribution"
+      refute debug_cfg =~ "PROVISIONING_PROFILE_SPECIFIER"
+
+      assert release_cfg =~ "CODE_SIGN_STYLE = Manual;"
+      assert release_cfg =~ ~s(CODE_SIGN_IDENTITY = "Apple Distribution";)
+      assert release_cfg =~ "CODE_SIGN_ENTITLEMENTS = App.Release.entitlements;"
+      refute release_cfg =~ "CODE_SIGN_ENTITLEMENTS = App.entitlements;"
+      assert release_cfg =~ ~s(PROVISIONING_PROFILE_SPECIFIER = "#{@profile}";)
+
+      assert project =~ "App.entitlements"
+      assert project =~ "App.Release.entitlements"
+      assert project =~ ~s("com.apple.Push")
+    end
+
+    test "omits CODE_SIGN_ENTITLEMENTS when neither configuration has push" do
+      project = Provision.project_pbxproj(@bundle, @team, @profile, %{debug: nil, release: nil})
+
+      refute project =~ "CODE_SIGN_ENTITLEMENTS"
+      refute project =~ "com.apple.Push"
+    end
+
+    test "distribution entitlements use production aps-environment and omit get-task-allow" do
+      xml = Provision.distribution_entitlements_plist_for_test(@team, @bundle, push?: true)
+
+      assert xml =~ "<key>aps-environment</key>"
+      assert xml =~ "<string>production</string>"
+      refute xml =~ "<string>development</string>"
+      refute xml =~ "<key>get-task-allow</key>"
+      assert xml =~ "<string>#{@team}.#{@bundle}</string>"
+      assert xml =~ "<string>#{@team}</string>"
+      assert xml =~ "<string>#{@team}.*</string>"
+      assert xml =~ "beta-reports-active"
+    end
+
+    test "distribution entitlements without push omit aps-environment" do
+      xml = Provision.distribution_entitlements_plist_for_test(@team, @bundle, push?: false)
+
+      refute xml =~ "<key>aps-environment</key>"
+      refute xml =~ "<key>get-task-allow</key>"
+    end
+
+    defp configuration_block(project, marker) do
+      case Regex.run(~r/#{Regex.escape(marker)} = \{(.*?)\t\t\};/s, project) do
+        [_, block] -> block
+        _ -> flunk("missing configuration #{marker}")
+      end
+    end
+  end
 end
