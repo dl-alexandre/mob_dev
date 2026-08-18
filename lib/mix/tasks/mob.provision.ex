@@ -292,8 +292,16 @@ defmodule Mix.Tasks.Mob.Provision do
   defp generate_xcodeproj(bundle_id, team_id, profile_specifier) do
     proj_dir = "ios/Provision.xcodeproj"
     proj_file = Path.join(proj_dir, "project.pbxproj")
-    entitlements = detect_push_entitlements()
-    if entitlements, do: IO.puts("  Push entitlements detected: #{entitlements}")
+    entitlements = resolve_configuration_entitlements(bundle_id, team_id)
+
+    case entitlements do
+      %{debug: debug, release: release} when is_binary(debug) and is_binary(release) ->
+        IO.puts("  Push entitlements — Debug: #{debug}, Release: #{release}")
+
+      _ ->
+        :ok
+    end
+
     expected = project_pbxproj(bundle_id, team_id, profile_specifier, entitlements)
 
     needs_write =
@@ -316,12 +324,29 @@ defmodule Mix.Tasks.Mob.Provision do
     end
   end
 
-  # Look for ios/*.entitlements files that declare aps-environment, indicating
-  # the app wants push notifications. Returns the filename (not full path) of
-  # the first matching file, or nil if none found.
-  defp detect_push_entitlements do
+  # Debug and Release are different signing identities. A single shared
+  # entitlements plist (development aps-environment + get-task-allow) is valid
+  # for Debug automatic signing but wrong for Release Apple Distribution /
+  # App Store profiles. Resolve them as a structural pair — never one file for
+  # both configurations.
+  defp resolve_configuration_entitlements(bundle_id, team_id) do
+    case detect_development_push_entitlements() do
+      nil ->
+        %{debug: nil, release: nil}
+
+      debug_file ->
+        release_file = ensure_distribution_entitlements!(debug_file, bundle_id, team_id)
+        %{debug: debug_file, release: release_file}
+    end
+  end
+
+  # Look for ios/*.entitlements files that declare aps-environment for
+  # development. Release entitlement stubs (*.Release.entitlements) are
+  # generated separately and must not be selected as the Debug contract.
+  defp detect_development_push_entitlements do
     "ios/*.entitlements"
     |> Path.wildcard()
+    |> Enum.reject(&String.ends_with?(&1, ".Release.entitlements"))
     |> Enum.find(fn path ->
       case File.read(path) do
         {:ok, content} -> String.contains?(content, "aps-environment")
@@ -332,6 +357,67 @@ defmodule Mix.Tasks.Mob.Provision do
       nil -> nil
       path -> Path.basename(path)
     end
+  end
+
+  defp ensure_distribution_entitlements!(debug_basename, bundle_id, team_id)
+       when is_binary(debug_basename) do
+    release_basename = distribution_entitlements_basename(debug_basename)
+    path = Path.join("ios", release_basename)
+    expected = distribution_entitlements_plist(team_id, bundle_id, push?: true)
+
+    case File.read(path) do
+      {:ok, ^expected} ->
+        IO.puts("  #{green()}✓#{reset()} ios/#{release_basename} — up to date")
+
+      _ ->
+        IO.puts("  Writing ios/#{release_basename}...")
+        File.mkdir_p!("ios")
+        File.write!(path, expected)
+    end
+
+    release_basename
+  end
+
+  defp distribution_entitlements_basename(debug_basename) do
+    root = Path.rootname(debug_basename)
+    root <> ".Release.entitlements"
+  end
+
+  # Distribution / App Store contract: production push when enabled, never
+  # get-task-allow (debugger attachment is a development-only entitlement).
+  defp distribution_entitlements_plist(team_id, bundle_id, opts) do
+    push? = Keyword.get(opts, :push?, false)
+
+    aps_block =
+      if push? do
+        """
+            <key>aps-environment</key>
+            <string>production</string>
+        """
+      else
+        ""
+      end
+
+    """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <!-- Distribution signing contract for Provision.xcodeproj Release. -->
+        <!-- get-task-allow is intentionally absent — it is development-only. -->
+        <key>application-identifier</key>
+        <string>#{team_id}.#{bundle_id}</string>
+        <key>com.apple.developer.team-identifier</key>
+        <string>#{team_id}</string>
+        <key>keychain-access-groups</key>
+        <array>
+            <string>#{team_id}.*</string>
+        </array>
+        <key>beta-reports-active</key>
+        <true/>
+    #{aps_block}</dict>
+    </plist>
+    """
   end
 
   # Discover an existing App Store profile for the bundle ID by parsing
@@ -842,32 +928,56 @@ defmodule Mix.Tasks.Mob.Provision do
   # only need to be unique within this file). MobProvision.swift is referenced
   # relative to the ios/ directory (the directory containing Provision.xcodeproj).
 
-  defp project_pbxproj(bundle_id, team_id, profile_specifier, entitlements_file)
-       when is_binary(profile_specifier) do
-    entitlements_ref =
-      if entitlements_file do
-        "\t\tAA00000F /* #{entitlements_file} */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = #{entitlements_file}; sourceTree = \"<group>\"; };\n"
-      else
-        ""
-      end
+  @doc false
+  # Public for generator tests — Debug and Release entitlement contracts must
+  # stay separate (development vs distribution). Do not collapse them.
+  @spec project_pbxproj(String.t(), String.t(), String.t(), String.t() | map()) :: String.t()
+  def project_pbxproj(bundle_id, team_id, profile_specifier, entitlements)
+      when is_binary(profile_specifier) do
+    entitlements = normalize_configuration_entitlements(entitlements)
+    debug_file = entitlements.debug
+    release_file = entitlements.release
 
-    entitlements_group_entry =
-      if entitlements_file do
-        "\t\t\t\tAA00000F /* #{entitlements_file} */,\n"
-      else
-        ""
-      end
+    file_refs =
+      entitlements
+      |> configuration_entitlement_files()
+      |> Enum.with_index()
+      |> Enum.map(fn {file, idx} ->
+        ref = entitlements_file_ref(idx)
+
+        "\t\t#{ref} /* #{file} */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = #{file}; sourceTree = \"<group>\"; };\n"
+      end)
+      |> Enum.join()
+
+    group_entries =
+      entitlements
+      |> configuration_entitlement_files()
+      |> Enum.with_index()
+      |> Enum.map(fn {file, idx} ->
+        ref = entitlements_file_ref(idx)
+        "\t\t\t\t#{ref} /* #{file} */,\n"
+      end)
+      |> Enum.join()
+
+    push? = is_binary(debug_file) or is_binary(release_file)
 
     target_attributes =
-      if entitlements_file do
+      if push? do
         "\t\t\t\tTargetAttributes = {\n\t\t\t\t\tAA000006 = {\n\t\t\t\t\t\tSystemCapabilities = {\n\t\t\t\t\t\t\t\"com.apple.Push\" = {\n\t\t\t\t\t\t\t\tenabled = 1;\n\t\t\t\t\t\t\t};\n\t\t\t\t\t\t};\n\t\t\t\t\t};\n\t\t\t\t};\n"
       else
         ""
       end
 
-    entitlements_setting =
-      if entitlements_file do
-        "\t\t\t\tCODE_SIGN_ENTITLEMENTS = #{entitlements_file};\n"
+    debug_entitlements_setting =
+      if is_binary(debug_file) do
+        "\t\t\t\tCODE_SIGN_ENTITLEMENTS = #{debug_file};\n"
+      else
+        ""
+      end
+
+    release_entitlements_setting =
+      if is_binary(release_file) do
+        "\t\t\t\tCODE_SIGN_ENTITLEMENTS = #{release_file};\n"
       else
         ""
       end
@@ -888,14 +998,14 @@ defmodule Mix.Tasks.Mob.Provision do
     /* Begin PBXFileReference section */
     \t\tAA000002 /* MobProvision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobProvision.swift; sourceTree = "<group>"; };
     \t\tAA000003 /* MobProvision.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MobProvision.app; sourceTree = BUILT_PRODUCTS_DIR; };
-    #{entitlements_ref}/* End PBXFileReference section */
+    #{file_refs}/* End PBXFileReference section */
 
     /* Begin PBXGroup section */
     \t\tAA000004 = {
     \t\t\tisa = PBXGroup;
     \t\t\tchildren = (
     \t\t\t\tAA000002 /* MobProvision.swift */,
-    #{entitlements_group_entry}\t\t\t\tAA000005 /* Products */,
+    #{group_entries}\t\t\t\tAA000005 /* Products */,
     \t\t\t);
     \t\t\tsourceTree = "<group>";
     \t\t};
@@ -967,7 +1077,7 @@ defmodule Mix.Tasks.Mob.Provision do
     \t\t\tisa = XCBuildConfiguration;
     \t\t\tbuildSettings = {
     \t\t\t\tCODE_SIGN_STYLE = Automatic;
-    #{entitlements_setting}\t\t\t\tDEVELOPMENT_TEAM = #{team_id};
+    #{debug_entitlements_setting}\t\t\t\tDEVELOPMENT_TEAM = #{team_id};
     \t\t\t\tGENERATE_INFOPLIST_FILE = YES;
     \t\t\t\tINFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
     \t\t\t\tINFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -986,7 +1096,7 @@ defmodule Mix.Tasks.Mob.Provision do
     \t\t\t\tCODE_SIGN_STYLE = Manual;
     \t\t\t\tCODE_SIGN_IDENTITY = "Apple Distribution";
     \t\t\t\t"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Distribution";
-    #{entitlements_setting}\t\t\t\tDEVELOPMENT_TEAM = #{team_id};
+    #{release_entitlements_setting}\t\t\t\tDEVELOPMENT_TEAM = #{team_id};
     \t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "#{profile_specifier}";
     \t\t\t\tGENERATE_INFOPLIST_FILE = YES;
     \t\t\t\tINFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -1042,6 +1152,37 @@ defmodule Mix.Tasks.Mob.Provision do
     \trootObject = AA000009 /* Project object */;
     }
     """
+  end
+
+  defp normalize_configuration_entitlements(%{debug: debug, release: release}) do
+    %{debug: debug, release: release}
+  end
+
+  # Legacy single-file callers treated one plist as both configs. Keep the
+  # arity working, but still surface the pair shape so tests assert Debug !=
+  # Release when push is enabled.
+  defp normalize_configuration_entitlements(nil), do: %{debug: nil, release: nil}
+
+  defp normalize_configuration_entitlements(file) when is_binary(file) do
+    %{debug: file, release: file}
+  end
+
+  defp configuration_entitlement_files(%{debug: debug, release: release}) do
+    [debug, release]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp entitlements_file_ref(0), do: "AA00000F"
+  defp entitlements_file_ref(1), do: "AA000010"
+
+  defp entitlements_file_ref(idx) when is_integer(idx),
+    do: "AA0000#{String.pad_leading(Integer.to_string(15 + idx), 2, "0")}"
+
+  @doc false
+  @spec distribution_entitlements_plist_for_test(String.t(), String.t(), keyword()) :: String.t()
+  def distribution_entitlements_plist_for_test(team_id, bundle_id, opts \\ []) do
+    distribution_entitlements_plist(team_id, bundle_id, opts)
   end
 
   # ── ANSI helpers ──────────────────────────────────────────────────────────────
