@@ -943,6 +943,7 @@ defmodule Mix.Tasks.Mob.Provision do
       |> Enum.with_index()
       |> Enum.map(fn {file, idx} ->
         ref = entitlements_file_ref(idx)
+
         "\t\t#{ref} /* #{file} */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = #{file}; sourceTree = \"<group>\"; };\n"
       end)
       |> Enum.join()
@@ -1173,7 +1174,9 @@ defmodule Mix.Tasks.Mob.Provision do
 
   defp entitlements_file_ref(0), do: "AA00000F"
   defp entitlements_file_ref(1), do: "AA000010"
-  defp entitlements_file_ref(idx) when is_integer(idx), do: "AA0000#{String.pad_leading(Integer.to_string(15 + idx), 2, "0")}"
+
+  defp entitlements_file_ref(idx) when is_integer(idx),
+    do: "AA0000#{String.pad_leading(Integer.to_string(15 + idx), 2, "0")}"
 
   @doc false
   def distribution_entitlements_plist_for_test(team_id, bundle_id, opts \\ []) do
