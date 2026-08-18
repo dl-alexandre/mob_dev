@@ -931,6 +931,7 @@ defmodule Mix.Tasks.Mob.Provision do
   @doc false
   # Public for generator tests — Debug and Release entitlement contracts must
   # stay separate (development vs distribution). Do not collapse them.
+  @spec project_pbxproj(String.t(), String.t(), String.t(), String.t() | map()) :: String.t()
   def project_pbxproj(bundle_id, team_id, profile_specifier, entitlements)
       when is_binary(profile_specifier) do
     entitlements = normalize_configuration_entitlements(entitlements)
@@ -1179,6 +1180,7 @@ defmodule Mix.Tasks.Mob.Provision do
     do: "AA0000#{String.pad_leading(Integer.to_string(15 + idx), 2, "0")}"
 
   @doc false
+  @spec distribution_entitlements_plist_for_test(String.t(), String.t(), keyword()) :: String.t()
   def distribution_entitlements_plist_for_test(team_id, bundle_id, opts \\ []) do
     distribution_entitlements_plist(team_id, bundle_id, opts)
   end
